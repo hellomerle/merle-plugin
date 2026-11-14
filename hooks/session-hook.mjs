@@ -79,7 +79,7 @@ const SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
 
 const shortOf = (id) => id.replaceAll('-', '').slice(0, 8).toLowerCase();
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms)); // honesty: waits between polls of Merle; only Merle moves a stage
 
 const readInput = () => {
   try {

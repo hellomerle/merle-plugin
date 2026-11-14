@@ -423,7 +423,7 @@ const api = async (path, init = {}) => {
       ...init.headers,
     },
   });
-  if (r.status === 401) throw Error('Merle refused this Mac’s token. Run merle-runner pair again.');
+  if (r.status === 401) throw Error(`Merle refused this Mac’s token. Pair it again: ${me()} pair`);
   return r;
 };
 
@@ -457,7 +457,7 @@ const ask = async (q) => {
   rl.close();
   return a.trim().toLowerCase();
 };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms)); // honesty: waits between polls of Merle; only Merle moves a stage
 
 /**
  * Pairs this Mac. The fingerprint shown is the one computed here from the key Merle sent, never Merle's own word for
@@ -477,7 +477,7 @@ export async function pair(answer = ask, say = console.log) {
       await fetch(`${MERLE}/v1/runner/pair/${start.id}`, { headers: { 'x-pairing-secret': start.secret } })
     ).json();
     if (r.status !== 'paired') continue;
-    if (!r.token) throw Error('This pairing was already picked up. Run merle-runner pair again.');
+    if (!r.token) throw Error(`This pairing was already picked up. Pair again: ${me()} pair`);
     const mine = fingerprintOf(r.publicKey);
     if (r.fingerprint !== mine)
       throw Error(
@@ -501,10 +501,10 @@ export async function pair(answer = ask, say = console.log) {
       rpId: site.hostname,
     });
     log({ event: 'paired', runner: start.id, fingerprint: mine });
-    say('Paired. Allow a repo next: merle-runner allow <folder> --mode default');
+    say(`Paired. Allow a repo next: ${me()} allow <folder> --product <product id>`);
     return true;
   }
-  throw Error('Nobody confirmed the code in 15 minutes. Run merle-runner pair again.');
+  throw Error(`Nobody confirmed the code in 15 minutes. Pair again: ${me()} pair`);
 }
 
 /**
@@ -685,7 +685,7 @@ const stillOk = (job) => {
 /** One look for jobs: each is checked, logged here and in Merle, and started or refused. */
 export async function once(now = Date.now(), wait = 25) {
   const pin = kept();
-  if (!pin) throw Error('This Mac isn’t paired. Run merle-runner pair.');
+  if (!pin) throw Error(`This Mac isn’t paired. Pair it: ${me()} pair`);
   const c = config();
   // Only as many as there's room for: the rest stay queued on Merle, never dropped. Paused or full, it asks for none,
   // and still takes the stops waiting for it: stopping is the safe direction.
@@ -830,11 +830,19 @@ async function run() {
 
 /** Where install puts the session hook: beside the runner it imports, at a path Codex's and Cursor's hooks can name. */
 export const HOOK_SCRIPT = join(HOME, 'hooks', 'session-hook.mjs');
+/** Where install puts this script, the copy the login item runs. */
+export const RUNNER_SCRIPT = join(HOME, 'runner', 'merle-runner.mjs');
+/**
+ * The runner as the person types it, for every message that names a command. Nothing goes on PATH: a stock Mac's PATH
+ * (/etc/paths) holds only /usr/local/bin and system folders, the first needs sudo on Apple silicon, and ~/.local/bin
+ * isn't on it. Adding one would mean editing the person's shell profile, so every message names Node and this file in
+ * full, as Merle's own pages and screens do.
+ */
+const me = () => `node ${shellWord(RUNNER_SCRIPT)}`;
 
 function install() {
-  const dir = join(HOME, 'runner');
-  mkdirSync(dir, { recursive: true });
-  const to = join(dir, 'merle-runner.mjs');
+  const to = RUNNER_SCRIPT;
+  mkdirSync(dirname(to), { recursive: true });
   copyFileSync(fileURLToPath(import.meta.url), to);
   chmodSync(to, 0o700);
   // The session hook from the same copy of the plugin, so the two always match (it imports this file).
@@ -861,7 +869,7 @@ function install() {
 `,
   );
   const hash = createHash('sha256').update(readFileSync(to)).digest('hex');
-  console.log(`Installed ${to}\nIts SHA-256: ${hash}`);
+  console.log(`Installed ${to}\nIts SHA-256: ${hash}\nRun it from now on as: ${me()}`);
   spawnSync('launchctl', ['unload', plist]);
   spawnSync('launchctl', ['load', plist]);
 }
@@ -895,7 +903,7 @@ async function main(argv) {
     case 'unpair':
       return unpair();
     case 'allow':
-      if (!args[0]) throw Error('Which folder? merle-runner allow <folder>');
+      if (!args[0]) throw Error(`Which folder? ${me()} allow <folder> --product <product id>`);
       return allow(args[0], flags);
     case 'deny': {
       const left = c.repos.filter((r) => realOf(r.path) !== realOf(args[0] ?? ''));
@@ -903,7 +911,7 @@ async function main(argv) {
       console.log(
         left.length < c.repos.length
           ? `Removed ${realOf(args[0] ?? '')}.`
-          : 'No allowed folder matched that path. merle-runner list shows them.',
+          : `No allowed folder matched that path. ${me()} list shows them.`,
       );
       return;
     }
@@ -942,10 +950,11 @@ async function main(argv) {
     case 'hooks':
       return clientHooks(args[0], args[1]);
     default:
+      console.log(`${me()} <command>`);
       console.log(
-        'merle-runner install | pair | allow <folder> [--mode plan|default|acceptEdits] [--confirm] | deny <folder> |',
+        'install | pair | allow <folder> [--product <id>] [--mode plan|default|acceptEdits] [--confirm] | deny <folder> |',
       );
-      console.log('             list | pause | resume | log | unpair | uninstall | hooks codex|cursor [off]');
+      console.log('list | pause | resume | log | unpair | uninstall | hooks codex|cursor [off]');
   }
 }
 
@@ -1077,14 +1086,14 @@ export function hooksIn(client, file) {
 function clientHooks(client, off, quiet = false) {
   const c = CLIENT_HOOKS[client];
   if (!c || (off !== undefined && off !== 'off')) {
-    console.log('merle-runner hooks codex|cursor [off]');
+    console.log(`${me()} hooks codex|cursor [off]`);
     process.exitCode = 1;
     return;
   }
   const on = off === undefined;
-  if (on && (!existsSync(HOOK_SCRIPT) || !existsSync(join(HOME, 'runner', 'merle-runner.mjs')))) {
+  if (on && (!existsSync(HOOK_SCRIPT) || !existsSync(RUNNER_SCRIPT))) {
     console.log(
-      'Install the runner first, from your copy of Merle’s plugin: node plugin/merle/runner/merle-runner.mjs install. It puts the session hook where these hooks run it.',
+      'Install the runner first: https://hellomerle.com/coding-agents#runner. It puts the session hook where these hooks run it.',
     );
     process.exitCode = 1;
     return;
@@ -1143,9 +1152,11 @@ function clientHooks(client, off, quiet = false) {
     return;
   }
   console.log(`Added Merle’s hooks to ${path}. ${c.done}`);
-  if (!kept()) console.log('This Mac isn’t paired yet, so they do nothing until it is: merle-runner pair.');
+  if (!kept()) console.log(`This Mac isn’t paired yet, so they do nothing until it is: ${me()} pair`);
   else if (!config().repos.length)
-    console.log('No folder is allowed yet, so no session checks in: merle-runner allow <folder>.');
+    console.log(
+      `No folder is allowed yet, so no session checks in: ${me()} allow <folder> --product <product id>`,
+    );
 }
 
 async function unpair() {
