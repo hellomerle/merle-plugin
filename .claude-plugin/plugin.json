@@ -1,0 +1,8 @@
+{
+  "name": "merle",
+  "version": "0.1.0",
+  "description": "Add Merle's feedback button to your app on a branch, and connect your coding agent to what customers report.",
+  "author": { "name": "Merle" },
+  "homepage": "https://hellomerle.com/docs",
+  "keywords": ["feedback", "customer-feedback", "mcp", "bug-reports"]
+}
