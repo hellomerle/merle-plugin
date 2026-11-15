@@ -469,7 +469,7 @@ export async function pair(answer = ask, say = console.log) {
   ).json();
   if (!start.code) throw Error('Merle didn’t give a pairing code.');
   say(
-    `\nIn Merle, open the product's Settings, Run on your Mac, and enter this code:\n\n    ${printable(start.code)}\n`,
+    `\nIn Merle, open Sessions, then Pair your Mac, and enter this code:\n\n    ${printable(start.code)}\n`,
   );
   say('Waiting for you to confirm it with your passkey (15 minutes)…');
   for (let t = Date.now(); Date.now() - t < 15 * 60_000; await sleep(2000)) {

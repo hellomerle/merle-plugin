@@ -78,7 +78,7 @@ change a setting.
 
 ## Notes from Merle to your running sessions
 
-On a Mac paired with Merle's runner ([Run on your Mac](https://hellomerle.com/coding-agents#runner)), the plugin hooks up each Claude Code session in a folder you
+On a Mac paired with Merle's runner (in Merle, Sessions, Pair your Mac; [install steps](https://hellomerle.com/coding-agents#runner)), the plugin hooks up each Claude Code session in a folder you
 allowed with `merle-runner allow`. In Merle's Sessions page you then see each session's state and send it a note, or
 Approve its work, and the session picks the note up itself: at the end of its turn, or, if it's idle, a hook waiting in
 the background wakes it. The hooks only dial out to Merle with the Mac's token from the Keychain; nothing listens on the
