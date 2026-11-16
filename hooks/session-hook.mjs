@@ -8,6 +8,8 @@
  *              decision "block" with the note as its reason, Cursor's followup_message (docs/more-agents.md).
  *   wait       Claude Code only, Stop with asyncRewake: waits in the background while the session is idle. A note is
  *              written to stderr and the hook exits 2, which wakes the session. Codex and Cursor have no such hook.
+ *   waiting    Claude Code's Notification hook on a permission prompt: tells Merle the session waits at the Mac, with
+ *              the tool's name and nothing else. after-tool.mjs says when it moved on (`answered`).
  *   unhook <id>      /merle unhook: notes stop reaching this session.
  *   signing on|off   Whether this Mac takes only notes signed with the passkey it pinned.
  *
@@ -19,7 +21,7 @@
  * Nothing here answers a permission prompt: the only output is words for Claude, labelled as the founder's.
  */
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   accessSync,
   appendFileSync,
@@ -28,6 +30,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { hostname } from 'node:os';
@@ -43,6 +46,7 @@ import {
   keep,
   kept,
   nonceStore,
+  pausedRev,
   LOG as RUNNER_LOG,
   signedBy,
   signingRequired,
@@ -368,6 +372,9 @@ const postCheckin = (pin, input, event, client) =>
       ...(MODES.includes(input.permission_mode) ? { mode: input.permission_mode } : {}),
       ...(productFor(input.cwd) ? { product: productFor(input.cwd) } : {}),
       ...(OTHER_CLIENTS.includes(client) ? { client } : {}),
+      // Claude Code's plugin holds the pause gate (pause-gate.mjs, its PreToolUse hook): Merle offers Pause only then.
+      // And whether this session's pause file is here, by the rev in it, so Merle never disagrees with the Mac for long.
+      ...(client === undefined ? { gate: true, paused: pausedRev(input.session_id) } : {}),
     }),
   });
 
@@ -388,6 +395,81 @@ async function start(input, client) {
     `When you call post_update, put session: "${short}" on it.`,
   ].join(' ');
   process.stdout.write(`${JSON.stringify(outputOf(client, 'SessionStart', context))}\n`);
+  return 0;
+}
+
+/** The tool a permission prompt asks about, from Claude Code's own words; null unless it is plainly a tool's name. */
+export function promptTool(input) {
+  const m = /^Claude needs your permission to use ([A-Za-z0-9_.:-]{1,64})$/.exec(
+    String(input?.message ?? ''),
+  );
+  return m ? m[1] : null;
+}
+/** Marks that this session waits at the Mac, so after-tool.mjs tells Merle when that prompt is over. */
+export const waitingMarker = (session) => join(SESSIONS, `${session}.waiting`);
+const readMarker = (session) => {
+  try {
+    const v = JSON.parse(readFileSync(waitingMarker(session), 'utf8'));
+    return v && typeof v === 'object' && typeof v.id === 'string' && /^w-[a-z0-9]{8,16}$/.test(v.id) ? v : {};
+  } catch (err) {
+    return err?.code === 'ENOENT' ? null : {};
+  }
+};
+const promptId = () =>
+  `w-${[...randomBytes(10)].map((b) => 'abcdefghijklmnopqrstuvwxyz0123456789'[b % 36]).join('')}`;
+
+/**
+ * Notification, on a permission prompt: Merle shows the session waiting at the Mac. Never answers the prompt. The marker
+ * is written first, so a prompt answered while Merle is slow still gets its "moved on".
+ */
+async function waiting(input) {
+  if (input.notification_type !== 'permission_prompt') return 0;
+  const pin = ready(input);
+  if (!pin || unhookedHere(input)) return 0;
+  const tool = promptTool(input);
+  const id = promptId();
+  mkdirSync(SESSIONS, { recursive: true });
+  writeFileSync(waitingMarker(input.session_id), JSON.stringify({ id, ...(tool ? { tool } : {}) }), {
+    mode: 0o600,
+  });
+  await api(pin, '/v1/runner/hook/waiting', {
+    method: 'POST',
+    body: JSON.stringify({ session: input.session_id, id, ...(tool ? { tool } : {}) }),
+  });
+  return 0;
+}
+/**
+ * The prompt is over (after-tool.mjs): after the tool it asked about, or whenever the person types or Claude waits for
+ * them (`any`). Merle stops showing it waiting. The marker goes once Merle took it (or no longer knows the session), so
+ * a Merle that didn't answer hears it with the next tool.
+ */
+export async function answered(input, any = false) {
+  if (typeof input?.session_id !== 'string' || !SESSION_ID.test(input.session_id)) return 0;
+  const m = readMarker(input.session_id);
+  if (m === null) return 0;
+  if (!any && typeof m.tool === 'string' && input.tool_name !== m.tool) return 0;
+  const drop = () => rmSync(waitingMarker(input.session_id), { force: true });
+  // A Merle that hasn't taken it for a quarter of an hour isn't asked again with every tool: its next check-in clears it.
+  let old = false;
+  try {
+    old = Date.now() - statSync(waitingMarker(input.session_id)).mtimeMs > 15 * 60_000;
+  } catch {}
+  const pin = old ? null : ready(input);
+  if (!pin || unhookedHere(input) || !m.id) {
+    drop();
+    return 0;
+  }
+  try {
+    await api(
+      pin,
+      '/v1/runner/hook/waiting',
+      { method: 'POST', body: JSON.stringify({ session: input.session_id, id: m.id, answered: true }) },
+      3_000,
+    );
+    drop();
+  } catch (err) {
+    if (err?.status === 404) drop();
+  }
   return 0;
 }
 
@@ -615,6 +697,8 @@ async function main([cmd, arg]) {
     }
     case 'wait':
       return wait(readInput());
+    case 'waiting':
+      return waiting(readInput());
     case 'unhook':
     case 'hookup':
       return hook(cmd, arg ?? '');

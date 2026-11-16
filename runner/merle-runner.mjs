@@ -8,6 +8,9 @@
 //
 // Commands: install, uninstall, pair, unpair, allow <path> [--mode plan|default|acceptEdits] [--confirm], deny <path>,
 // list, pause, resume, status, log, run (what the login item runs), hooks codex|cursor [off] (session hookup for them).
+//
+// It also carries a hooked-up session's pause from Merle to this Mac (docs/sessions.md, Pause): the session's own pause
+// file, which the plugin's PreToolUse hook (hooks/pause-gate.mjs) reads before every tool. A pause only stops work.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { verify as checkSig, createHash, createPublicKey } from 'node:crypto';
 import {
@@ -19,9 +22,11 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -423,9 +428,149 @@ const api = async (path, init = {}) => {
       ...init.headers,
     },
   });
-  if (r.status === 401) throw Error(`Merle refused this Mac’s token. Pair it again: ${me()} pair`);
+  if (r.status === 401) {
+    // Removed in Merle: nobody there can resume a pause any more, so none is left holding a session here.
+    if (k?.token) clearPauses();
+    throw Error(`Merle refused this Mac’s token. Pair it again: ${me()} pair`);
+  }
   return r;
 };
+
+// --- Pause (docs/sessions.md): a hooked-up session's pause from Merle, as a file of its own on this Mac. ---
+/** Where the session hooks keep each session's own record (session-hook.mjs), and where its pause file goes. */
+export const SESSIONS = join(HOME, 'sessions');
+const SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
+/** A session's short id, as session-hook.mjs names its record: the first 8 of its id without dashes. */
+const shortOf = (id) => id.replaceAll('-', '').slice(0, 8).toLowerCase();
+/** The highest rev a pause file may say (session-pause.ts PAUSE_REV_MAX): a file saying more reads as unreadable, 0. */
+const REV_MAX = 1_000_000_000;
+/**
+ * A session's pause file, by its full id (never the short one two sessions could share). While it is there, the
+ * plugin's PreToolUse hook (hooks/pause-gate.mjs) refuses every tool and ends the turn. Written only here, whole and
+ * renamed into place, so a hook writing the session's other record at the same moment can't take it away.
+ */
+export const pauseFile = (session) => join(SESSIONS, `${session}.paused`);
+/**
+ * Every pause on this Mac goes, with the gate's markers and the prompts' (session-hook.mjs): unpaired or removed in
+ * Merle, nobody could resume one.
+ */
+export function clearPauses() {
+  let names = [];
+  try {
+    names = readdirSync(SESSIONS);
+  } catch {
+    return;
+  }
+  for (const n of names)
+    if (n.endsWith('.paused') || n.endsWith('.held') || n.endsWith('.waiting'))
+      try {
+        unlinkSync(join(SESSIONS, n));
+      } catch {}
+}
+/** The session's own record, as its hooks wrote it when it checked in on this Mac; {} when there's none. */
+const sessionRecord = (session) => {
+  try {
+    const v = JSON.parse(readFileSync(join(SESSIONS, `${shortOf(session)}.json`), 'utf8'));
+    return v && typeof v === 'object' ? v : {};
+  } catch {
+    return {};
+  }
+};
+/**
+ * Why this Mac won't apply a pause or resume Merle handed it, or null. A pause only for a session that checked in on
+ * this Mac (its hooks keep its full id) and isn't unhooked here. A resume only takes away a pause Merle made, so it
+ * needs no more than a sane id.
+ */
+export function pauseRefusal(p) {
+  if (!p || typeof p !== 'object') return 'shape';
+  if (typeof p.session !== 'string' || !SESSION_ID.test(p.session)) return 'shape';
+  if (typeof p.paused !== 'boolean' || !Number.isSafeInteger(p.rev) || p.rev < 1) return 'shape';
+  if (!p.paused) return null;
+  const rec = sessionRecord(p.session);
+  if (rec.session !== p.session) return 'not hooked up here';
+  if (rec.unhooked === true) return 'unhooked here';
+  return null;
+}
+/** Applies one pause or resume: the file written whole, or taken away; false when a newer one is on file. Throws if it can't. */
+export function applyPause(p, now = Date.now()) {
+  const f = pauseFile(p.session);
+  // A newer change already on file (another runner process got there first) is never undone by an older one.
+  if ((pausedRev(p.session) ?? 0) > p.rev) return false;
+  // The gate's first-refusal marker goes with every change: a new pause asks Claude to end its turn once more.
+  rmSync(join(SESSIONS, `${p.session}.held`), { force: true });
+  if (!p.paused) {
+    rmSync(f, { force: true });
+    return true;
+  }
+  mkdirSync(SESSIONS, { recursive: true });
+  const tmp = `${f}.${process.pid}.tmp`;
+  // A file of its own (O_EXCL): never written through a link left in its place.
+  rmSync(tmp, { force: true });
+  writeFileSync(tmp, JSON.stringify({ session: p.session, rev: p.rev, at: now }), {
+    mode: 0o600,
+    flag: 'wx',
+  });
+  renameSync(tmp, f);
+  return true;
+}
+/**
+ * The rev written in a session's pause file: null when there is none, 0 when it is there but can't be read (the gate
+ * counts that as paused too). What a session's check-in tells Merle (session-hook.mjs).
+ */
+export function pausedRev(session) {
+  let raw;
+  try {
+    raw = readFileSync(pauseFile(session), 'utf8');
+  } catch (err) {
+    return err?.code === 'ENOENT' || err?.code === 'ENOTDIR' ? null : 0;
+  }
+  try {
+    const rev = JSON.parse(raw)?.rev;
+    return Number.isSafeInteger(rev) && rev >= 0 && rev <= REV_MAX ? rev : 0;
+  } catch {
+    return 0;
+  }
+}
+/**
+ * Each pause and resume Merle handed over: checked, applied, logged here, and answered with the change it applied.
+ * Pausing is the safe way: it is applied even if its log line can't be written. A resume lets work go on again, so no
+ * line, no resume. Returns whether Merle took every answer.
+ */
+async function pauses(list) {
+  let told = true;
+  for (const p of list.slice(0, 50)) {
+    let why = pauseRefusal(p);
+    if (why === 'shape' && !(typeof p?.session === 'string' && SESSION_ID.test(p.session))) continue;
+    if (!why)
+      try {
+        if (!p.paused) log({ event: 'resuming', session: p.session, rev: p.rev });
+        if (!applyPause(p)) why = 'older than the one on this Mac';
+      } catch {
+        why = p.paused ? 'couldn’t write its pause file' : 'couldn’t log or take its pause away';
+      }
+    try {
+      log({
+        event: why ? 'pause refused' : p.paused ? 'paused' : 'resumed',
+        session: p.session,
+        rev: p.rev,
+        ...(why ? { reason: why } : {}),
+      });
+    } catch {}
+    const r = await api('/v1/runner/pauses', {
+      method: 'POST',
+      body: JSON.stringify({
+        session: p.session,
+        rev: Number.isSafeInteger(p.rev) && p.rev >= 1 ? p.rev : 1,
+        state: why ? 'refused' : p.paused ? 'paused' : 'resumed',
+        ...(why ? { reason: why } : {}),
+      }),
+    }).catch(() => null);
+    // A 409 means Merle has a newer change; the next look hands it over. Anything else unanswered is sent again, and
+    // so is a refusal of a pause that wasn't one, whatever Merle said: nothing to apply, so no reason to ask at once.
+    if (!r || (!r.ok && (r.status !== 409 || why === 'shape'))) told = false;
+  }
+  return told;
+}
 
 /** The branch checked out in a folder, or null. */
 const branchOf = (path) => {
@@ -694,11 +839,14 @@ export async function once(now = Date.now(), wait = 25) {
   // Which products this Mac allows, so Merle offers its one key only for those (docs/loop.md). Ids only, no folders.
   const products = [...new Set(c.repos.map((r) => r.product))].join(',');
   const got = await (
-    await api(`/v1/runner/jobs?wait=${wait}&limit=${room}&v=3&products=${encodeURIComponent(products)}`)
+    await api(`/v1/runner/jobs?wait=${wait}&limit=${room}&v=4&products=${encodeURIComponent(products)}`)
   ).json();
   const jobs = Array.isArray(got?.jobs) ? got.jobs : [];
   const done = [];
   if (Array.isArray(got?.stops) && got.stops.length) await stops(got.stops, pin, now);
+  // Pauses before jobs, room or not: pausing is the safe way. One Merle didn't take is handed over again; the next look
+  // waits a little first (`untold`), so a Mac that can't answer doesn't ask in a tight loop.
+  if (Array.isArray(got?.pauses) && got.pauses.length && !(await pauses(got.pauses))) untold = true;
   for (const { job, assertion } of jobs) {
     let why;
     try {
@@ -794,7 +942,10 @@ export async function report() {
 
 /** One turn of the loop: how long to wait before the next. Paused, half a minute, asking Merle only for stops. */
 let lastReport = 0;
+/** A pause or resume Merle didn't take the answer for: the next look waits a few seconds rather than asking at once. */
+let untold = false;
 export async function tick(now = Date.now()) {
+  untold = false;
   try {
     // Sessions already running are reported whatever happens next: paused or full, their state still reaches Merle.
     if (now - lastReport > 10_000) {
@@ -813,7 +964,7 @@ export async function tick(now = Date.now()) {
       return 15_000;
     }
     await once(Date.now());
-    return 0;
+    return untold ? 5_000 : 0;
   } catch (err) {
     console.error(String(err.message ?? err));
     return 10_000;
@@ -1163,6 +1314,7 @@ async function unpair() {
   const k = kept();
   if (k) await api(`/v1/runner/unpair`, { method: 'POST' }).catch(() => {});
   keep(null);
+  clearPauses();
   log({ event: 'unpaired' });
   console.log('Unpaired. This Mac takes no jobs now.');
 }
