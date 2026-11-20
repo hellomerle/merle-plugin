@@ -27,8 +27,10 @@ import {
   appendFileSync,
   constants,
   existsSync,
+  linkSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -448,7 +450,33 @@ export async function answered(input, any = false) {
   const m = readMarker(input.session_id);
   if (m === null) return 0;
   if (!any && typeof m.tool === 'string' && input.tool_name !== m.tool) return 0;
-  const drop = () => rmSync(waitingMarker(input.session_id), { force: true });
+  // Only while the marker is still this prompt's: a newer prompt written meanwhile keeps its own, to be told in turn.
+  // Moved aside first (one step), read there, and put back without overwriting when it is another prompt's, so a newer
+  // marker written at any moment is never the one deleted.
+  const drop = () => {
+    const at = waitingMarker(input.session_id);
+    const aside = `${at}.${process.pid}.${randomBytes(4).toString('hex')}`;
+    try {
+      renameSync(at, aside);
+    } catch {
+      return; // gone already
+    }
+    let v = null;
+    try {
+      v = JSON.parse(readFileSync(aside, 'utf8'));
+    } catch {}
+    const same =
+      !v ||
+      typeof v !== 'object' ||
+      typeof v.id !== 'string' ||
+      !/^w-[a-z0-9]{8,16}$/.test(v.id) ||
+      v.id === m.id;
+    if (!same)
+      try {
+        linkSync(aside, at); // never over a marker written since: that one is newer still
+      } catch {}
+    rmSync(aside, { force: true });
+  };
   // A Merle that hasn't taken it for a quarter of an hour isn't asked again with every tool: its next check-in clears it.
   let old = false;
   try {
@@ -521,7 +549,8 @@ async function wait(input) {
     try {
       got = await api(
         pin,
-        `/v1/runner/hook/notes?session=${input.session_id}&wait=${WAIT}`,
+        // With its word on the pause file, as a check-in gives it: a Resume its runner can't apply waits on it.
+        `/v1/runner/hook/notes?session=${input.session_id}&wait=${WAIT}&paused=${pausedRev(input.session_id) ?? 'none'}`,
         {},
         (WAIT + 15) * 1000,
       );
