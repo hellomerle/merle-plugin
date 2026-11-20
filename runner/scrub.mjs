@@ -92,6 +92,13 @@ const CREDENTIALS = [
     new RegExp("(?<=\\bpass(?:word|wort)(?:\\s{1,3}(?:for|f\xFCr)(?:\\s{1,3}[\\p{L}\\p{N}_.'\u2019()/-]{1,40}){1,3})?\\s{0,3}(?:(?:(?:is(?: now)?|ist|lautet)\\b|:)\\s{0,3}:?|(?:was|to)\\b\\s{0,3}:?(?=\\s{0,3}(?:\\S{0,40}[\\d=+/!@#$%^&*]|\\p{L}{16})))\\s{0,3})\\S{4,}", "giu"),
     "id"
   ],
+  // The same with any run of spaces (Codex, #69): sorting, drafting and MCP don't fold spaces first. Each run sits
+  // between fixed words, and `(?=\S{4})` comes first, so inside a run nothing is tried: still one linear pass.
+  [/(?=\S{4})(?<=\bpass(?:word|wort)(?:\s+(?:is(?:\s+now)?|ist|lautet)\b(?:\s*:)?|\s*:)\s*)\S{4,}/giu, "id"],
+  [
+    new RegExp("(?=\\S{4})(?<=\\bpass(?:word|wort)\\s+(?:was|to)\\b(?:\\s*:)?\\s*)(?=\\S{0,40}[\\d=+/!@#$%^&*]|\\p{L}{16})\\S{4,}", "giu"),
+    "id"
+  ],
   // A value after a word that names a secret ("bad key c2VjcmV0…", "token: abc123…"): with a digit or base64 padding.
   [/(?<=\b(?:key|token|secret|pass(?:word|wort)?|pwd|api[- ]?key)\b[:=\s]{1,3})(?=\S*[\d=+/])\S{8,}/gi, "id"],
   // A quoted value after a setting's name, the name quoted or not, its quotes escaped any number of times or not, by

@@ -24,6 +24,8 @@ export const TURN_MAX = 8 * 1024;
 const LINE_MAX = 600;
 /** How much of one line is read at all, before scrubbing: well past LINE_MAX, so a cut there hides no secret that leaves. */
 const SCRUB_MAX = 2_000;
+/** Folded characters a cut text must still hold, so its cut lies past LINE_MAX by more than any value is long. */
+const SAFE = LINE_MAX + 400;
 const TOOL = /^[A-Za-z0-9_.:-]{1,64}$/;
 /** What Claude Code itself puts in a user turn: a block that opens with a tag. Never the person's words. */
 const MACHINE = /^\s*<[a-z][a-z0-9_-]*[\s>/]/i;
@@ -123,14 +125,19 @@ const typed = (s) =>
  * whole, then cuts it to LINE_MAX, so a cut can't hide what makes a secret a secret.
  */
 const words = (raw) => {
-  // A first cut, far past what leaves (LINE_MAX), only to bound the work: what makes a secret within the first LINE_MAX
-  // characters a secret is still there when render scrubs it.
-  const s = [...raw].slice(0, SCRUB_MAX).join('');
+  // A first cut, far past what leaves (LINE_MAX), only to bound the work.
+  const all = [...raw];
+  const s = all.length > SCRUB_MAX ? all.slice(0, SCRUB_MAX).join('') : raw;
   const out = s
     .replace(FENCE, (m) => `\n[code, ${chars(m)} characters, left on the Mac]\n`)
     .replace(INDENTED, (m) => `\n[code, ${chars(m)} characters, left on the Mac]\n`)
     .replace(INLINE, '[code]');
   return out.includes('`') ? `[code, ${chars(s)} characters, left on the Mac]` : out;
+};
+/** The agent's words as a line; `cut`: how long it was, when words cut it first (render checks that cut never shows). */
+const said = (kind, raw, more = {}) => {
+  const n = chars(raw);
+  return { ...more, kind, text: words(raw), ...(n > SCRUB_MAX ? { cut: n } : {}) };
 };
 /** At most LINE_MAX whole characters. */
 const cutLine = (s) => {
@@ -221,13 +228,13 @@ export function extract(entries, keep = () => true) {
       read.assistant++;
       for (const b of content) {
         if (b?.type === 'text' && typeof b.text === 'string' && b.text.trim())
-          lines.push({ kind: 'agent', text: words(b.text) });
+          lines.push(said('agent', b.text));
         else if (b?.type === 'tool_use') {
           const name = typeof b.name === 'string' && TOOL.test(b.name) ? b.name : 'a tool';
           const line = { kind: 'tool', text: name, error: false };
           if (typeof b.id === 'string') tools.set(b.id, line);
           lines.push(line);
-          for (const w of ownWords(b.name, b.input)) lines.push({ ...w, text: words(w.text) });
+          for (const w of ownWords(b.name, b.input)) lines.push(said(w.kind, w.text, w));
         } else dropped++; // thinking, redacted thinking, images, anything new
       }
       continue;
@@ -254,7 +261,12 @@ export function render(lines, known = []) {
     // Settings first, line by line, so a value not quoted takes the rest of its own line and no more.
     const set = settings(l.text);
     // Scrubbed whole, then cut: a cut first could take away what makes a secret recognisable.
-    const clean = cutLine(s.plain(s.text(set.replace(/\s+/g, ' ').trim())));
+    const whole = s.plain(s.text(set.replace(/\s+/g, ' ').trim()));
+    // A line words cut before reading it: code, values and spaces taken out can bring that cut within what leaves,
+    // and a value it halves ("postgres://app:hunter2" of "…@localhost", "anna at host dot" of "… com") is one no rule
+    // knows. Unless SAFE is still left, all of it stays on the Mac (Codex, #69).
+    const clean =
+      l.cut && chars(whole) < SAFE ? `[long text, ${l.cut} characters, left on the Mac]` : cutLine(whole);
     if (clean !== raw) scrubbed++;
     const tail = l.kind === 'tool' && l.error ? ' (failed)' : l.kind === 'todo' && l.done ? ' (done)' : '';
     return `${LABEL[l.kind]}: ${clean}${tail}`;
