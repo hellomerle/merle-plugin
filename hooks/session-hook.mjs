@@ -431,13 +431,44 @@ async function waiting(input) {
   const tool = promptTool(input);
   const id = promptId();
   mkdirSync(SESSIONS, { recursive: true });
-  writeFileSync(waitingMarker(input.session_id), JSON.stringify({ id, ...(tool ? { tool } : {}) }), {
-    mode: 0o600,
-  });
+  // Written whole, then put in place in one step, so the hook that drops a marker never reads half of one.
+  const tmp = `${waitingMarker(input.session_id)}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ id, ...(tool ? { tool } : {}) }), { mode: 0o600 });
+  renameSync(tmp, waitingMarker(input.session_id));
   await api(pin, '/v1/runner/hook/waiting', {
     method: 'POST',
     body: JSON.stringify({ session: input.session_id, id, ...(tool ? { tool } : {}) }),
   });
+  return 0;
+}
+/** post_update however it is installed: `mcp__merle__…`, `mcp__plugin_merle_merle__…`, a server renamed. */
+export const POST_UPDATE = /^mcp__[A-Za-z0-9_-]+__post_update$/;
+/** post_update's own block for an ask (copy-mcp.ts `MCP.said.ask`): the id, then Merle's short fixed sentence. */
+const ASK_BLOCK = /^Merle ask (k-[a-z]{10}): [^\n]{1,100}$/;
+/**
+ * Where an agent's ask was made (after-tool.mjs, after post_update): the ask id Merle put in the tool's own answer, and
+ * Claude Code's id for this session, go to Merle with this Mac's token, so a person's answer comes back here only.
+ * Nothing else of the call leaves: not what the agent sent, not the rest of the answer. One such block exactly, or nothing.
+ */
+export async function askedHere(input) {
+  if (input?.hook_event_name !== 'PostToolUse' || !POST_UPDATE.test(String(input?.tool_name ?? ''))) return 0;
+  if (typeof input?.session_id !== 'string' || !SESSION_ID.test(input.session_id)) return 0;
+  // Only a content block of its own, all of it Merle's fixed words: an id inside other words (a proposal's title or a
+  // question echoed in the reply) is never read, and can't block the real one either.
+  const r = input.tool_response;
+  const blocks = Array.isArray(r) ? r : Array.isArray(r?.content) ? r.content : [];
+  const ids = blocks
+    .map((b) => (b?.type === 'text' && typeof b.text === 'string' ? ASK_BLOCK.exec(b.text)?.[1] : undefined))
+    .filter(Boolean);
+  if (ids.length !== 1) return 0;
+  const pin = ready(input);
+  if (!pin || unhookedHere(input)) return 0;
+  await api(
+    pin,
+    '/v1/runner/hook/ask',
+    { method: 'POST', body: JSON.stringify({ session: input.session_id, ask: ids[0] }) },
+    2_000,
+  ).catch(() => null);
   return 0;
 }
 /**
