@@ -705,9 +705,14 @@ export const printable = (x) => String(x ?? '').replace(/\p{Cc}/gu, ''); // U+00
 export const fingerprintOf = (spki) =>
   sha256(b64(spki)).subarray(0, 16).toString('hex').toUpperCase().match(/.{4}/g).join(' ');
 
+/** How long a call to Merle may take unless it says otherwise: well inside the minute a handed-out pause waits on. */
+const API_MS = ((n) => (Number.isSafeInteger(n) && n > 0 && n <= 600_000 ? n : 15_000))(
+  Number(process.env.MERLE_API_MS),
+);
 const api = async (path, init = {}) => {
   const k = kept();
   const r = await fetch(`${MERLE}${path}`, {
+    signal: AbortSignal.timeout(API_MS),
     ...init,
     headers: {
       'content-type': 'application/json',
@@ -824,7 +829,9 @@ export function pausedRev(session) {
  * line, no resume. Returns whether Merle took every answer.
  */
 async function pauses(list) {
-  let told = true;
+  // Every file first, then every answer: a slow or lost answer never leaves a later session's pause unwritten (Merle
+  // holds its hook's word for a minute after a hand-out), and each answer waits at most API_MS.
+  const done = [];
   for (const p of list.slice(0, 50)) {
     let why = pauseRefusal(p);
     if (why === 'shape' && !(typeof p?.session === 'string' && SESSION_ID.test(p.session))) continue;
@@ -843,6 +850,10 @@ async function pauses(list) {
         ...(why ? { reason: why } : {}),
       });
     } catch {}
+    done.push({ p, why });
+  }
+  let told = true;
+  for (const { p, why } of done) {
     const r = await api('/v1/runner/pauses', {
       method: 'POST',
       body: JSON.stringify({
@@ -855,6 +866,9 @@ async function pauses(list) {
     // A 409 means Merle has a newer change; the next look hands it over. Anything else unanswered is sent again, and
     // so is a refusal of a pause that wasn't one, whatever Merle said: nothing to apply, so no reason to ask at once.
     if (!r || (!r.ok && (r.status !== 409 || why === 'shape'))) told = false;
+    // No answer at all (Merle slow or down): the rest wait for the next look, which hands them over again, rather than
+    // each waiting out its own timeout. Every file is already written.
+    if (!r) break;
   }
   return told;
 }
@@ -905,9 +919,13 @@ export async function pair(answer = ask, say = console.log) {
   );
   say('Waiting for you to confirm it with your passkey (15 minutes)…');
   for (let t = Date.now(); Date.now() - t < 15 * 60_000; await sleep(2000)) {
-    const r = await (
-      await fetch(`${MERLE}/v1/runner/pair/${start.id}`, { headers: { 'x-pairing-secret': start.secret } })
-    ).json();
+    // A slow answer is asked again with the next poll, never the end of the wait.
+    const r = await fetch(`${MERLE}/v1/runner/pair/${start.id}`, {
+      headers: { 'x-pairing-secret': start.secret },
+      signal: AbortSignal.timeout(API_MS),
+    })
+      .then((x) => x.json())
+      .catch((err) => (err?.name === 'TimeoutError' ? {} : Promise.reject(err)));
     if (r.status !== 'paired') continue;
     if (!r.token) throw Error(`This pairing was already picked up. Pair again: ${me()} pair`);
     const mine = fingerprintOf(r.publicKey);
@@ -1128,7 +1146,11 @@ export async function once(now = Date.now(), wait = 25) {
   // Which products this Mac allows, so Merle offers its one key only for those (docs/loop.md). Ids only, no folders.
   const products = [...new Set(c.repos.map((r) => r.product))].join(',');
   const got = await (
-    await api(`/v1/runner/jobs?wait=${wait}&limit=${room}&v=4&products=${encodeURIComponent(products)}`)
+    await api(`/v1/runner/jobs?wait=${wait}&limit=${room}&v=4&products=${encodeURIComponent(products)}`, {
+      // Its wait and a full minute more: Merle marks a stop or a job delivered before it answers, so a look given up
+      // too soon could lose one. A reply lost on the way (the connection or the Worker gone) still can, as before.
+      signal: AbortSignal.timeout((wait + 60) * 1000),
+    })
   ).json();
   const jobs = Array.isArray(got?.jobs) ? got.jobs : [];
   const done = [];

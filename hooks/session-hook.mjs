@@ -29,6 +29,7 @@ import {
   existsSync,
   linkSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -485,10 +486,30 @@ async function waiting(input) {
   const tool = promptTool(input);
   const id = promptId();
   mkdirSync(SESSIONS, { recursive: true });
-  // Written whole, then put in place in one step, so the hook that drops a marker never reads half of one.
-  const tmp = `${waitingMarker(input.session_id)}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ id, ...(tool ? { tool } : {}) }), { mode: 0o600 });
-  renameSync(tmp, waitingMarker(input.session_id));
+  // What a hook that died left beside this session's marker (a half-written one, or one moved aside to be dropped)
+  // goes with the session's next prompt, once it is a minute old. A moved-aside one keeps the marker's own time, so it
+  // can be taken while its hook still runs; that only ever takes a marker a new one replaces now.
+  const at = waitingMarker(input.session_id);
+  let names = [];
+  try {
+    names = readdirSync(SESSIONS).filter((n) => n.startsWith(`${input.session_id}.waiting.`));
+  } catch {}
+  for (const n of names)
+    try {
+      const f = join(SESSIONS, n);
+      if (Date.now() - statSync(f).mtimeMs > 60_000) rmSync(f, { force: true });
+    } catch {}
+  // Written whole, then put in place in one step, so the hook that drops a marker never reads half of one. A file of
+  // its own (O_EXCL), as the pause file is: never written through a link left in its place.
+  const tmp = `${at}.${process.pid}.tmp`;
+  rmSync(tmp, { force: true });
+  try {
+    writeFileSync(tmp, JSON.stringify({ id, ...(tool ? { tool } : {}) }), { mode: 0o600, flag: 'wx' });
+    renameSync(tmp, at);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
   await api(pin, '/v1/runner/hook/waiting', {
     method: 'POST',
     body: JSON.stringify({ session: input.session_id, id, ...(tool ? { tool } : {}) }),
