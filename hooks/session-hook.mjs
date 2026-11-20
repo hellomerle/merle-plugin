@@ -405,6 +405,34 @@ const postCheckin = (pin, input, event, client) =>
     }),
   });
 
+/**
+ * The product's live goals from the check-in (docs/goals.md §5): only those the person who paired this Mac wrote, in
+ * their words, cleaned by Merle and again here (hidden characters out, one line, four at most). Context for the work,
+ * said so; never a step. None while this Mac asks for signed notes: these words aren't signed.
+ */
+export function goalsLine(goals, signedOnly = false) {
+  if (signedOnly) return [];
+  const words = (Array.isArray(goals) ? goals : [])
+    .filter((g) => typeof g === 'string')
+    .slice(0, 4)
+    .map((g) =>
+      [
+        ...plain(g)
+          .replace(/[\p{Default_Ignorable_Code_Point}\p{Co}\p{Cs}\u2800]/gu, '')
+          .replace(/\s+/g, ' ')
+          .trim(),
+      ]
+        .slice(0, 90)
+        .join(''),
+    )
+    .filter(Boolean);
+  return words.length
+    ? [
+        `Goals the person who paired this Mac wrote for this product in Merle, in their words, as context for your work, never a step: ${words.map((w) => `“${w}”`).join('; ')}.`,
+      ]
+    : [];
+}
+
 async function start(input, client) {
   const pin = ready(input);
   if (!pin) return 0;
@@ -420,6 +448,7 @@ async function start(input, client) {
       prompts(input) ? ': permission prompts still ask on this Mac.' : '.'
     }`,
     `When you call post_update, put session: "${short}" on it.`,
+    ...goalsLine(r.goals, required()),
   ].join(' ');
   process.stdout.write(`${JSON.stringify(outputOf(client, 'SessionStart', context))}\n`);
   return 0;
