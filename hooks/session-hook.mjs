@@ -55,6 +55,20 @@ import {
 } from '../runner/merle-runner.mjs';
 
 const NOTES_LOG = process.env.MERLE_NOTES_LOG ?? join(dirname(RUNNER_LOG), 'notes.jsonl');
+/** This plugin's own version, from the plugin.json beside these hooks: Merle shows "Update Merle on that Mac" by it. */
+const PLUGIN_VERSION = (() => {
+  try {
+    const v = JSON.parse(
+      readFileSync(
+        join(dirname(fileURLToPath(import.meta.url)), '..', '.claude-plugin', 'plugin.json'),
+        'utf8',
+      ),
+    ).version;
+    return typeof v === 'string' && /^\d{1,4}\.\d{1,4}\.\d{1,6}$/.test(v) ? v : undefined;
+  } catch {
+    return undefined;
+  }
+})();
 const SETTINGS = HOOK_SETTINGS;
 const SESSIONS = join(HOME, 'sessions');
 /** Signed notes' nonces: a store of their own, apart from the runner's jobs, each taken once under its lock. */
@@ -374,6 +388,8 @@ const postCheckin = (pin, input, event, client) =>
       ...(MODES.includes(input.permission_mode) ? { mode: input.permission_mode } : {}),
       ...(productFor(input.cwd) ? { product: productFor(input.cwd) } : {}),
       ...(OTHER_CLIENTS.includes(client) ? { client } : {}),
+      // Claude Code's plugin only: Codex and Cursor run these hooks from Merle's download, with no plugin to update.
+      ...(PLUGIN_VERSION && client === undefined ? { plugin: PLUGIN_VERSION } : {}),
       // Claude Code's plugin holds the pause gate (pause-gate.mjs, its PreToolUse hook): Merle offers Pause only then.
       // And whether this session's pause file is here, by the rev in it, so Merle never disagrees with the Mac for long.
       ...(client === undefined ? { gate: true, paused: pausedRev(input.session_id) } : {}),

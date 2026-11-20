@@ -19,6 +19,18 @@ The second line opens a panel where you choose where to install it. From a shell
 claude plugin install merle --marketplace hellomerle/merle-plugin
 ```
 
+## Update
+
+Each new Merle publishes a newer version of this plugin. From a shell:
+
+```sh
+claude plugin marketplace update merle
+claude plugin update merle@merle
+```
+
+Then start a new Claude Code session. Merle's Sessions page says "Update Merle on that Mac" when a session's plugin is
+older than the published one.
+
 ## Add the feedback button
 
 Open Claude Code in your repo, with everything committed, and run:
