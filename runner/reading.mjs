@@ -44,12 +44,10 @@ const MERLE_NOTE = /\(via Merle\)/;
 const FENCE = /((`|~)\2{2,})[\s\S]*?(?:\n[ \t]*\1\2*[ \t]*(?=\n|$)|$)/g;
 const FENCED = /`{3,}|~{3,}/;
 /**
- * A line indented as code: four spaces or a tab, at any depth, after any spaces. Pasted code nobody marked or indented
- * can't be told from words, and leaves as words (scrubbed like them).
+ * In what the person typed, two spaces or a tab at a line's start are enough (a JSON or YAML block): a typed message is
+ * rarely indented otherwise, and one taken for code only leaves as its length. The agent's words keep four (INDENTED).
+ * Pasted code nobody marked or indented can't be told from words, and leaves as words (scrubbed like them).
  */
-const INDENT = /(?:^|\n) *(?: {4}|\t)/;
-/** In what the person typed, two spaces at a line's start are enough (a JSON or YAML block): a typed message is rarely
- * indented otherwise, and one taken for code only leaves as its length. */
 const TYPED_INDENT = /(?:^|\n)(?: {2}| *\t)/;
 const INDENTED = /(?:^|\n)(?: *(?: {4}|\t)[^\n]*(?:\n|$))+/g;
 const INLINE = /(`+)[\s\S]*?\1/g;

@@ -246,6 +246,15 @@ export async function readTurn(input, now = Date.now(), last = false) {
       // Still on, right before it leaves: an off typed meanwhile wins.
       if (readingSince(pin) === null) return 'off';
       try {
+        // Words leave only once Merle says, with no words sent, that it reads this session now: unhooked there, or
+        // hooked up again after a gap, it answers 410 and nothing of the session goes (a Codex review).
+        if (typeof body.text === 'string')
+          await api(
+            pin,
+            '/v1/runner/hook/reading',
+            { method: 'POST', body: JSON.stringify({ session: body.session, ready: true }) },
+            READ_WAIT_MS,
+          );
         await api(
           pin,
           '/v1/runner/hook/reading',
