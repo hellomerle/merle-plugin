@@ -32,7 +32,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -186,7 +186,7 @@ export function stopRefusal(stop, a, pin, { now, mine, requireSigned, seen }) {
 }
 
 /** Which kinds of thing a passkey signs here. Each says what it is in the challenge, so one never passes as another. */
-const DOMAINS = ['job', 'note', 'signing-off', 'stop'];
+const DOMAINS = ['job', 'note', 'signing-off', 'stop', 'reading-on'];
 /** The WebAuthn challenge for a job or a note: SHA-256 of "merle-<domain>", a zero byte, then its exact bytes. */
 export const challengeOf = (domain, bytes) => sha256(`merle-${domain}\0${bytes}`).toString('base64url');
 /**
@@ -220,6 +220,57 @@ export function signedBy(domain, bytes, a, pin) {
     ok = false;
   }
   if (!ok) return 'signature';
+  return null;
+}
+
+/**
+ * A change this Mac makes only with the pinned passkey (`kind`: "signing-off" or "reading-on"): it asks Merle, the person
+ * who paired it signs exactly that ask with Touch ID on Merle's page, and this Mac checks the signature itself
+ * (signedBy, with the ask's own domain, so one kind never passes for another) and takes its nonce once. `ask` calls
+ * Merle with this Mac's token. Returns the ask's bytes and the assertion, or null.
+ */
+export async function passkeySays(pin, kind, ask, nonces, say = console.log) {
+  let made;
+  try {
+    made = await ask('/v1/runner/hook/signing-off', { method: 'POST', body: JSON.stringify({ kind }) });
+  } catch (err) {
+    say(
+      typeof err?.shown === 'string' ? err.shown : 'Merle didn’t answer. Try again when this Mac is online.',
+    );
+    return null;
+  }
+  let o;
+  try {
+    o = JSON.parse(made.canonical);
+  } catch {
+    return null;
+  }
+  const now = Date.now();
+  if (o?.type !== kind || o.runner !== pin.runner || o.id !== made.id || !(o.expires > now)) return null;
+  say(
+    'Confirm it on Merle’s Sessions page, signed in as the person who paired this Mac, with Touch ID. Waiting up to 10 minutes…',
+  );
+  while (Date.now() < o.expires) {
+    let got;
+    try {
+      got = await ask(`/v1/runner/hook/signing-off/${encodeURIComponent(made.id)}?wait=25`, {}, 40_000);
+    } catch {
+      return null;
+    }
+    if (!got.assertion) continue;
+    const why = signedBy(kind, made.canonical, got.assertion, pin);
+    if (why) {
+      say(`That signature didn’t pass on this Mac (${why}).`);
+      return null;
+    }
+    try {
+      if (typeof o.nonce !== 'string' || !nonces.take(o.nonce, o.expires, Date.now())) return null;
+    } catch {
+      return null;
+    }
+    return { canonical: made.canonical, assertion: got.assertion };
+  }
+  say('Nobody confirmed it in 10 minutes.');
   return null;
 }
 
@@ -279,6 +330,232 @@ export const hookSettings = () => {
  * Keychain, so deleting the file can't turn it off. Either one says on, it's on.
  */
 export const signingRequired = () => !!hookSettings().requireSigned || kept()?.requireSigned === true;
+
+// --- Session reading (docs/sessions.md, Session reading): off unless the person who paired this Mac turned it on here.
+/** This Mac's reading setting: the signed ask that turned it on, and the folders left out. */
+export const READING = join(HOME, 'reading.json');
+/** What each session last sent, and from where in its record: `reading/<session id>.json` and `.last`. */
+export const READ_DIR = join(HOME, 'reading');
+export const READING_LOG = process.env.MERLE_READING_LOG ?? join(dirname(LOG), 'reading.jsonl');
+const readingNonces = nonceStore(join(HOME, 'reading-nonces.json'));
+const readingFile = () => {
+  try {
+    const v = JSON.parse(readFileSync(READING, 'utf8'));
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+  } catch {
+    return {};
+  }
+};
+/**
+ * Whether this Mac reads its sessions: only while its setting holds an ask the pinned passkey signed as "reading-on" for
+ * this runner. Anything else (no file, one that won't parse, a signature that doesn't check) is off: the safe way.
+ */
+export function readingOn(pin = kept()) {
+  return readingSince(pin) !== null;
+}
+/**
+ * Since when this Mac reads its sessions: when it turned reading on, once the signed ask came back with its Touch ID
+ * (`at`, never the ask's own earlier time, so nothing typed while the ask waited leaves), or null when it doesn't. Only
+ * entries written since then are read. An ask made before the last `reading off` here counts as none, so an old signed
+ * ask put back can't turn it on again.
+ */
+export function readingSince(pin = kept()) {
+  const r = readingFile();
+  const on = r.on;
+  if (!pin || !on || typeof on.canonical !== 'string') return null;
+  let o;
+  try {
+    o = JSON.parse(on.canonical);
+  } catch {
+    return null;
+  }
+  const ok =
+    o?.type === 'reading-on' &&
+    o.runner === pin.runner &&
+    Number.isSafeInteger(o.created) &&
+    Number.isSafeInteger(on.at) &&
+    !(typeof r.offAt === 'number' && o.created <= r.offAt) &&
+    signedBy('reading-on', on.canonical, on.assertion, pin) === null;
+  return ok ? Math.max(o.created, on.at) : null;
+}
+/** Whether a folder is left out of reading (`reading on --except <folder>`): it, or anything under it. */
+export function readingLeftOut(cwd) {
+  // A Mac's disk ignores case by default: so does this, so ~/SRC/secret leaves out ~/src/secret.
+  const fold = (p) => (process.platform === 'darwin' ? p.toLowerCase() : p);
+  const here = fold(realOf(String(cwd ?? '')));
+  const except = Array.isArray(readingFile().except) ? readingFile().except : [];
+  // By path, not by string: the root, or a folder written with a trailing slash, leaves out all under it.
+  return except.some((p) => {
+    if (typeof p !== 'string' || !p) return false;
+    const r = relative(resolve(fold(p)), here);
+    return r === '' || (r !== '..' && !r.startsWith('../') && !isAbsolute(r));
+  });
+}
+const saveReading = (v) => {
+  mkdirSync(HOME, { recursive: true });
+  const tmp = `${READING}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(v)}\n`, { mode: 0o600 });
+  renameSync(tmp, READING);
+};
+/**
+ * Changes the reading setting as one step against every other process changing it (a terminal's `--except`, a hook
+ * telling Merle off): read and written under a lock file made with O_EXCL, so no change is lost. A lock older than ten
+ * seconds was left by a process that died. After three seconds the change is made anyway: off must never wait.
+ */
+function updateReading(change) {
+  mkdirSync(HOME, { recursive: true });
+  const lock = `${READING}.lock`;
+  let held = false;
+  for (const t = Date.now(); !held && Date.now() - t < 3_000; ) {
+    try {
+      closeSync(openSync(lock, 'wx', 0o600));
+      held = true;
+    } catch {
+      try {
+        if (Date.now() - statSync(lock).mtimeMs > 10_000) unlinkSync(lock);
+      } catch {}
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20); // honesty: waits for the lock; moves no stage
+    }
+  }
+  try {
+    saveReading(change(readingFile()));
+  } finally {
+    if (held) rmSync(lock, { force: true });
+  }
+}
+/** One line in the reading log. Throws if it can't. */
+export function readingLog(entry) {
+  mkdirSync(dirname(READING_LOG), { recursive: true });
+  appendFileSync(READING_LOG, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`, {
+    mode: 0o600,
+  });
+}
+
+/**
+ * `reading on|off|show`. On needs a person at this Mac (a terminal, the word typed) and the pinned passkey's Touch ID on
+ * Merle's page (passkeySays, "reading-on"). Off and leaving a folder out need neither: they only send less.
+ */
+async function reading(what, arg, flags, answer = ask) {
+  const r = readingFile();
+  if (what === 'off') {
+    try {
+      readingLog({ event: 'off' });
+    } catch {}
+    // Off here at once, whatever Merle says; Merle is told now, and again with each turn until it hears (tellOff).
+    updateReading((now) => ({ ...now, on: null, offAt: Date.now(), offTold: false }));
+    const told = await tellOff();
+    console.log(
+      told
+        ? 'Reading is off. Nothing from your sessions leaves this Mac for Merle.'
+        : 'Reading is off on this Mac: nothing leaves it. Merle didn’t answer, so it hears with your sessions’ next turn.',
+    );
+    return 0;
+  }
+  if (what === 'show') {
+    const short = String(arg ?? '').toLowerCase();
+    if (!/^[a-z0-9]{8}$/.test(short)) {
+      console.log(`Give the session’s id in Merle, 8 letters and digits: ${me()} reading show <id>`);
+      return 1;
+    }
+    let names = [];
+    try {
+      names = readdirSync(READ_DIR).filter(
+        (n) => n.endsWith('.last') && n.replaceAll('-', '').slice(0, 8).toLowerCase() === short,
+      );
+    } catch {}
+    if (!names.length) {
+      console.log(`Nothing from session ${short} has left this Mac.`);
+      return 0;
+    }
+    process.stdout.write(printableLines(readFileSync(join(READ_DIR, names[0]), 'utf8')));
+    return 0;
+  }
+  if (what !== 'on') {
+    console.log(`${me()} reading on [--except <folder>] | off | show <session id>`);
+    return 1;
+  }
+  if (flags.except) {
+    // Leaving a folder out only sends less: no Touch ID, and it turns nothing on.
+    const left = realOf(flags.except);
+    updateReading((now) => ({
+      ...now,
+      except: [...new Set([...(Array.isArray(now.except) ? now.except : []), left])],
+    }));
+    try {
+      readingLog({ event: 'except', folder: left });
+    } catch {}
+    console.log(`Sessions in ${left} aren’t read.`);
+    return 0;
+  }
+  if (readingOn()) {
+    console.log('Reading is on already.');
+    return 0;
+  }
+  const pin = kept();
+  if (!pin?.token) {
+    console.log(`This Mac isn’t paired. Pair it first: ${me()} pair`);
+    return 1;
+  }
+  // An off Merle hasn't heard yet goes first: told after this on, it would turn Merle off again.
+  if (!(await tellOff())) {
+    console.log('Merle didn’t answer. Try again when this Mac is online.');
+    return 1;
+  }
+  if (!process.stdin.isTTY) {
+    console.log('Turning reading on needs you at the Mac: run it in a terminal yourself.');
+    return 1;
+  }
+  console.log(
+    'With reading on, at the end of each turn of a Claude Code session in an allowed folder, this Mac sends Merle what you typed (long pastes and anything holding code as their length) and the agent’s own words, questions, plans and to-dos (the code they quote left out), and each tool’s name. Never a tool’s input or output, a file’s contents, or the agent’s thinking. Scrubbed here and again in Merle, summed up there, and only the summary is kept, shown to you alone.',
+  );
+  if ((await answer('Type on to turn reading on: ')) !== 'on') {
+    console.log('Left off.');
+    return 1;
+  }
+  // Merle's answer as JSON, or a throw for anything but a 2xx: passkeySays reads a throw as "didn't answer".
+  const call = async (path, init = {}, ms = 10_000) => {
+    const res = await api(path, { ...init, signal: AbortSignal.timeout(ms) });
+    if (!res.ok) {
+      const said = await res.json().catch(() => ({}));
+      throw Object.assign(Error(`merle ${res.status}`), {
+        shown: typeof said?.error === 'string' ? printable(said.error).slice(0, 200) : undefined,
+      });
+    }
+    return res.json();
+  };
+  const signed = await passkeySays(pin, 'reading-on', call, readingNonces);
+  if (!signed) {
+    console.log('Left off.');
+    return 1;
+  }
+  try {
+    readingLog({ event: 'on' });
+  } catch {
+    console.log('This Mac can’t write its reading log, so reading stays off.');
+    return 1;
+  }
+  updateReading((now) => ({ ...now, on: { ...signed, at: Date.now() } }));
+  console.log(`Reading is on. ${me()} reading show <session id> prints exactly what was last sent.`);
+  return 0;
+}
+/** Tells Merle reading is off, if it hasn't heard yet: true once it has. */
+export async function tellOff() {
+  const r = readingFile();
+  if (r.offTold !== false) return true;
+  const res = await api('/v1/runner/hook/reading-off', {
+    method: 'POST',
+    body: '{}',
+    signal: AbortSignal.timeout(5_000),
+  }).catch(() => null);
+  if (!res?.ok) return false;
+  updateReading((now) => ({ ...now, offTold: true }));
+  return true;
+}
+/** What Merle or a file holds, fit for a terminal: lines kept, no other control characters. */
+const printableLines = (x) => {
+  const t = String(x ?? '').replace(/[^\P{Cc}\n]/gu, '');
+  return t.endsWith('\n') ? t : `${t}\n`;
+};
 
 /** The jobs this Mac started: job id to its session's short id, repo path and ref. Unreadable reads as none. */
 export const started = () => {
@@ -681,7 +958,9 @@ async function allow(path, flags) {
   const confirm = flags.confirm ?? was?.confirm === true;
   c.repos = [
     ...c.repos.filter((r) => realOf(r.path) !== full),
-    { path: full, remote, product, mode, confirm },
+    // When it was allowed: a session's reading never sends what was written in it before then. Allowed again, it keeps
+    // its first time.
+    { path: full, remote, product, mode, confirm, at: Number.isSafeInteger(was?.at) ? was.at : Date.now() },
   ];
   save(c);
   log({ event: 'allowed', path: full, remote, product, mode, confirm });
@@ -1100,12 +1379,17 @@ async function main(argv) {
       return run();
     case 'hooks':
       return clientHooks(args[0], args[1]);
+    case 'reading':
+      process.exitCode = await reading(args[0], args[1], flags);
+      return;
     default:
       console.log(`${me()} <command>`);
       console.log(
         'install | pair | allow <folder> [--product <id>] [--mode plan|default|acceptEdits] [--confirm] | deny <folder> |',
       );
-      console.log('list | pause | resume | log | unpair | uninstall | hooks codex|cursor [off]');
+      console.log(
+        'list | pause | resume | log | unpair | uninstall | hooks codex|cursor [off] | reading on [--except <folder>]|off|show <id>',
+      );
   }
 }
 

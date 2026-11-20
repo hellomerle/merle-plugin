@@ -1,5 +1,5 @@
 {
-  "description": "After a Bash command that looks like a deploy, remind the agent that only a production deploy that worked should tell Merle it's live. On a Mac paired with Merle, hook up each session so the founder's notes from Merle reach it: a check-in at start, a look for a note at the end of each turn, and a waiting hook that wakes an idle session when one comes. While the person who paired the Mac has paused a session from Merle, a check before each tool refuses it and ends the turn. When a session waits on a permission prompt, Merle is told it waits at the Mac, with the tool's name only; the prompt is answered on the Mac.",
+  "description": "After a Bash command that looks like a deploy, remind the agent that only a production deploy that worked should tell Merle it's live. On a Mac paired with Merle, hook up each session so the founder's notes from Merle reach it: a check-in at start, a look for a note at the end of each turn, and a waiting hook that wakes an idle session when one comes. While the person who paired the Mac has paused a session from Merle, a check before each tool refuses it and ends the turn. When a session waits on a permission prompt, Merle is told it waits at the Mac, with the tool's name only; the prompt is answered on the Mac. Only if the person who paired the Mac turned session reading on there with Touch ID, the end of each turn sends Merle a scrubbed extract of the session's own words (with its question, plan and to-do words; never any other tool's input or output).",
   "hooks": {
     "PostToolUse": [
       {
@@ -101,6 +101,23 @@
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/session-hook.mjs\" wait",
             "asyncRewake": true,
             "timeout": 86400
+          },
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/reading-hook.mjs\"",
+            "async": true,
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/reading-hook.mjs\"",
+            "timeout": 15
           }
         ]
       }

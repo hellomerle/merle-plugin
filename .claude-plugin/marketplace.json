@@ -9,7 +9,7 @@
       "name": "merle",
       "source": "./",
       "description": "Add Merle's feedback button to your app on a branch, and connect your coding agent to what customers report.",
-      "version": "0.1.85"
+      "version": "0.1.95"
     }
   ]
 }

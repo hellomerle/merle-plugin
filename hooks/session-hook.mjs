@@ -48,6 +48,7 @@ import {
   keep,
   kept,
   nonceStore,
+  passkeySays,
   pausedRev,
   LOG as RUNNER_LOG,
   signedBy,
@@ -132,7 +133,15 @@ const repoFor = (cwd) => {
   const remote = remoteIn(here);
   return (remote && repos.find((r) => r.remote === remote)) || null;
 };
-const allowed = (cwd) => !!repoFor(cwd);
+export const allowed = (cwd) => !!repoFor(cwd);
+/**
+ * Since when the folder is allowed (`merle-runner allow` writes `at`), or null when it isn't: what was written in it
+ * before then is never read. A folder allowed before allow wrote `at` counts from 0 (that was before reading existed).
+ */
+export const allowedSince = (cwd) => {
+  const r = repoFor(cwd);
+  return r ? (Number.isSafeInteger(r.at) && r.at > 0 ? r.at : 0) : null;
+};
 /** The Merle product this Mac allowed the folder for, as the person typed it there: the session is bound to it. */
 const productFor = (cwd) => {
   const p = repoFor(cwd)?.product;
@@ -205,7 +214,7 @@ const saveLocal = (short, v) => {
   writeFileSync(sessionFile(short), JSON.stringify({ ...local(short), ...v }), { mode: 0o600 });
 };
 /** Unhooked here (/merle unhook): it takes nothing, whatever Merle says, until it's hooked up here again. */
-const unhookedHere = (input) => local(shortOf(input.session_id)).unhooked === true;
+export const unhookedHere = (input) => local(shortOf(input.session_id)).unhooked === true;
 const ratchet = (signed) => {
   if (signed !== true || required()) return;
   setRequired(true);
@@ -235,7 +244,7 @@ const logNote = (entry) =>
     mode: 0o600,
   });
 
-const api = async (pin, path, init = {}, ms = 10_000) => {
+export const api = async (pin, path, init = {}, ms = 10_000) => {
   const r = await fetch(`${pin.origin}${path}`, {
     ...init,
     headers: { 'content-type': 'application/json', authorization: `Bearer ${pin.token}` },
@@ -363,7 +372,7 @@ async function take(pin, notes, input, by) {
 }
 
 /** The Mac is paired, the folder allowed, the session id sane: the pin; otherwise null, and the hook does nothing. */
-const ready = (input) => {
+export const ready = (input) => {
   if (typeof input.session_id !== 'string' || !SESSION_ID.test(input.session_id)) return null;
   if (typeof input.cwd !== 'string') return null;
   const pin = kept();
@@ -676,47 +685,7 @@ async function hook(what, short) {
  * Sessions page, and this Mac checks the signature itself, as it checks a job or a note (signedBy).
  */
 async function passkeySaysOff(pin) {
-  let ask;
-  try {
-    ask = await api(pin, '/v1/runner/hook/signing-off', { method: 'POST', body: '{}' });
-  } catch {
-    console.log('Merle didn’t answer. Try again when this Mac is online.');
-    return false;
-  }
-  let o;
-  try {
-    o = JSON.parse(ask.canonical);
-  } catch {
-    return false;
-  }
-  const now = Date.now();
-  if (o?.type !== 'signing-off' || o.runner !== pin.runner || o.id !== ask.id || !(o.expires > now))
-    return false;
-  console.log(
-    'Confirm it on Merle’s Sessions page, signed in as the person who paired this Mac, with Touch ID. Waiting up to 10 minutes…',
-  );
-  while (Date.now() < o.expires) {
-    let got;
-    try {
-      got = await api(pin, `/v1/runner/hook/signing-off/${encodeURIComponent(ask.id)}?wait=25`, {}, 40_000);
-    } catch {
-      return false;
-    }
-    if (!got.assertion) continue;
-    const why = signedBy('signing-off', ask.canonical, got.assertion, pin);
-    if (why) {
-      console.log(`That signature didn’t pass on this Mac (${why}).`);
-      return false;
-    }
-    try {
-      if (typeof o.nonce !== 'string' || !noteNonces.take(o.nonce, o.expires, Date.now())) return false;
-    } catch {
-      return false;
-    }
-    return true;
-  }
-  console.log('Nobody confirmed it in 10 minutes.');
-  return false;
+  return passkeySays(pin, 'signing-off', (path, init, ms) => api(pin, path, init, ms), noteNonces);
 }
 
 async function signing(on) {
