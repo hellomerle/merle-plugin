@@ -22,6 +22,8 @@ export const PASTE_MAX = 1000;
 export const TURN_MAX = 8 * 1024;
 /** One line of the agent's own words, at most, in characters. */
 const LINE_MAX = 600;
+/** How much of one line is read at all, before scrubbing: well past LINE_MAX, so a cut there hides no secret that leaves. */
+const SCRUB_MAX = 2_000;
 const TOOL = /^[A-Za-z0-9_.:-]{1,64}$/;
 /** What Claude Code itself puts in a user turn: a block that opens with a tag. Never the person's words. */
 const MACHINE = /^\s*<[a-z][a-z0-9_-]*[\s>/]/i;
@@ -46,6 +48,9 @@ const FENCED = /`{3,}|~{3,}/;
  * can't be told from words, and leaves as words (scrubbed like them).
  */
 const INDENT = /(?:^|\n) *(?: {4}|\t)/;
+/** In what the person typed, two spaces at a line's start are enough (a JSON or YAML block): a typed message is rarely
+ * indented otherwise, and one taken for code only leaves as its length. */
+const TYPED_INDENT = /(?:^|\n)(?: {2}| *\t)/;
 const INDENTED = /(?:^|\n)(?: *(?: {4}|\t)[^\n]*(?:\n|$))+/g;
 const INLINE = /(`+)[\s\S]*?\1/g;
 /** Any case of a word, as a pattern: `key` matches key, Key and KEY, so the rest of a pattern can keep its case. */
@@ -111,17 +116,28 @@ export function entriesOf(text) {
 
 const chars = (s) => [...s].length;
 const typed = (s) =>
-  chars(s) > PASTE_MAX || FENCED.test(s) || INDENT.test(s) || /`[^`]+`/.test(s)
+  chars(s) > PASTE_MAX || FENCED.test(s) || TYPED_INDENT.test(s) || /`[^`]+`/.test(s)
     ? `[pasted, ${chars(s)} characters, left on the Mac]`
     : s;
-/** The agent's words with the code it quotes left on the Mac, cut to LINE_MAX whole characters. */
-const words = (s) => {
+/**
+ * The agent's words with the code it quotes left on the Mac. A backtick left after that is code that didn't parse (a
+ * span holding a fence, one not closed): then the whole of it stays on the Mac. Never cut here: render scrubs a line
+ * whole, then cuts it to LINE_MAX, so a cut can't hide what makes a secret a secret.
+ */
+const words = (raw) => {
+  // A first cut, far past what leaves (LINE_MAX), only to bound the work: what makes a secret within the first LINE_MAX
+  // characters a secret is still there when render scrubs it.
+  const s = [...raw].slice(0, SCRUB_MAX).join('');
   const out = s
     .replace(FENCE, (m) => `\n[code, ${chars(m)} characters, left on the Mac]\n`)
     .replace(INDENTED, (m) => `\n[code, ${chars(m)} characters, left on the Mac]\n`)
     .replace(INLINE, '[code]');
-  const all = [...out];
-  return all.length > LINE_MAX ? `${all.slice(0, LINE_MAX).join('')}…` : out;
+  return out.includes('`') ? `[code, ${chars(s)} characters, left on the Mac]` : out;
+};
+/** At most LINE_MAX whole characters. */
+const cutLine = (s) => {
+  const all = [...s];
+  return all.length > LINE_MAX ? `${all.slice(0, LINE_MAX).join('')}…` : s;
 };
 const str = (x) => (typeof x === 'string' ? x : '');
 
@@ -239,7 +255,8 @@ export function render(lines, known = []) {
     const raw = l.text.replace(/\s+/g, ' ').trim();
     // Settings first, line by line, so a value not quoted takes the rest of its own line and no more.
     const set = settings(l.text);
-    const clean = s.plain(s.text(set.replace(/\s+/g, ' ').trim()));
+    // Scrubbed whole, then cut: a cut first could take away what makes a secret recognisable.
+    const clean = cutLine(s.plain(s.text(set.replace(/\s+/g, ' ').trim())));
     if (clean !== raw) scrubbed++;
     const tail = l.kind === 'tool' && l.error ? ' (failed)' : l.kind === 'todo' && l.done ? ' (done)' : '';
     return `${LABEL[l.kind]}: ${clean}${tail}`;

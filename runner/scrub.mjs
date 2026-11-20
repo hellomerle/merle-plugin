@@ -83,8 +83,15 @@ const CREDENTIALS = [
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "id"],
   [/\bAKIA[0-9A-Z]{16}\b/g, "id"],
   [/(?<=\bBasic\s+)[A-Za-z0-9+/=]{8,}/g, "id"],
-  // In prose too: "the password is …", "is now …", "set the password to …", "das Passwort ist …".
-  [/(?<=\bpass(?:word|wort)(?: is(?: now)?| to| ist|:)\s*)\S{4,}/gi, "id"],
+  // In prose too: "the password is …", "is now …", "set the password to …", "das Passwort ist …",
+  // "is:", "was", "for prod is", "lautet" too: the word for it, what it is for (one word), then a word that says the value.
+  [
+    // Every run in it is bounded, so it costs the same at each place whatever the input: never a slow pass. "was" and
+    // "to" take only what looks like a secret (a digit or a sign, or one word of 16 letters or more, a passphrase), so
+    // "my password was rejected" stays words.
+    new RegExp("(?<=\\bpass(?:word|wort)(?:\\s{1,3}(?:for|f\xFCr)(?:\\s{1,3}[\\p{L}\\p{N}_.'\u2019()/-]{1,40}){1,3})?\\s{0,3}(?:(?:(?:is(?: now)?|ist|lautet)\\b|:)\\s{0,3}:?|(?:was|to)\\b\\s{0,3}:?(?=\\s{0,3}(?:\\S{0,40}[\\d=+/!@#$%^&*]|\\p{L}{16})))\\s{0,3})\\S{4,}", "giu"),
+    "id"
+  ],
   // A value after a word that names a secret ("bad key c2VjcmV0…", "token: abc123…"): with a digit or base64 padding.
   [/(?<=\b(?:key|token|secret|pass(?:word|wort)?|pwd|api[- ]?key)\b[:=\s]{1,3})(?=\S*[\d=+/])\S{8,}/gi, "id"],
   // A quoted value after a setting's name, the name quoted or not, its quotes escaped any number of times or not, by

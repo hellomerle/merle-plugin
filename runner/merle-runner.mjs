@@ -442,7 +442,8 @@ async function reading(what, arg, flags, answer = ask) {
       readingLog({ event: 'off' });
     } catch {}
     // Off here at once, whatever Merle says; Merle is told now, and again with each turn until it hears (tellOff).
-    updateReading((now) => ({ ...now, on: null, offAt: Date.now(), offTold: false }));
+    // Which on this turns off (the ask it was signed under), so a late off from another hook can't turn a newer on off.
+    updateReading((now) => ({ ...now, on: null, offAt: Date.now(), offTold: false, offFrom: askOf(now.on) }));
     const told = await tellOff();
     console.log(
       told
@@ -538,13 +539,22 @@ async function reading(what, arg, flags, answer = ask) {
   console.log(`Reading is on. ${me()} reading show <session id> prints exactly what was last sent.`);
   return 0;
 }
+/** The ask an on was signed under, from its signed words; null for anything else. */
+const askOf = (on) => {
+  try {
+    const id = JSON.parse(on?.canonical ?? 'null')?.id;
+    return typeof id === 'string' && /^so-[a-z]{8}$/.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+};
 /** Tells Merle reading is off, if it hasn't heard yet: true once it has. */
 export async function tellOff() {
   const r = readingFile();
   if (r.offTold !== false) return true;
   const res = await api('/v1/runner/hook/reading-off', {
     method: 'POST',
-    body: '{}',
+    body: JSON.stringify(typeof r.offFrom === 'string' ? { ask: r.offFrom } : {}),
     signal: AbortSignal.timeout(5_000),
   }).catch(() => null);
   if (!res?.ok) return false;
