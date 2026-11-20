@@ -125,9 +125,11 @@ const typed = (s) =>
  * whole, then cuts it to LINE_MAX, so a cut can't hide what makes a secret a secret.
  */
 const words = (raw) => {
-  // A first cut, far past what leaves (LINE_MAX), only to bound the work.
+  // A first cut, far past what leaves (LINE_MAX), only to bound the work. The unbroken run it lands in goes whole:
+  // half of one long token (a key, a JWT, an address) is one no rule knows, and code taken out before it can bring it
+  // to the front of what leaves. A value of several words it halves is render's to hold back (`cut`, SAFE).
   const all = [...raw];
-  const s = all.length > SCRUB_MAX ? all.slice(0, SCRUB_MAX).join('') : raw;
+  const s = all.length > SCRUB_MAX ? all.slice(0, SCRUB_MAX).join('').replace(/\S*$/u, '') : raw;
   const out = s
     .replace(FENCE, (m) => `\n[code, ${chars(m)} characters, left on the Mac]\n`)
     .replace(INDENTED, (m) => `\n[code, ${chars(m)} characters, left on the Mac]\n`)
