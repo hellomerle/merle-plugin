@@ -314,7 +314,7 @@ export function noteText(note, { short, worktree, host, signed, prompts }) {
     ...(note.kind === 'approved'
       ? [
           '',
-          `${note.paired ? 'The founder' : from} approved this session’s latest work. It merges and deploys nothing.`,
+          `${note.paired ? 'The founder' : from} approved the plan this session asked about in Merle. It merges and deploys nothing.`,
         ]
       : []),
     ...(refs.length
