@@ -1,0 +1,246 @@
+#!/usr/bin/env node
+/**
+ * One fact per hook event, appended to this Mac's spool (docs/sessions.md, Session events). The runner sends the spool
+ * to Merle in batches; this never dials out, so it stays as fast as reading a file.
+ *
+ * Facts only, the same whatever coding agent sends them: which event, when, and counts or fixed words. Never what the
+ * person typed (a prompt is its length), never a tool's input or output (a tool is its name, whether it worked and its
+ * exit code), never a command (a commit, a push, a pull request or a test run is read from the command's first words
+ * and named by a fixed word), never a path. A subagent is its id and type, so each builder is its own row in Merle.
+ *
+ * Only for a session this Mac hooked up (session-hook.mjs left its record), and the spool never grows past SPOOL_MAX:
+ * past it, events are left out until the runner has sent what's there.
+ */
+import { createHash, randomBytes } from 'node:crypto';
+import { appendFileSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HOME = process.env.MERLE_RUNNER_HOME ?? join(homedir(), 'Library', 'Application Support', 'Merle');
+export const SPOOL = join(HOME, 'spool');
+export const SPOOL_FILE = join(SPOOL, 'events.jsonl');
+/** A marker the runner watches: send now, not at the next look (waiting at the Mac, a session ending, a failure). */
+export const SPOOL_NOW = join(SPOOL, 'now');
+export const SPOOL_MAX = 1024 * 1024;
+const SESSION = /^[A-Za-z0-9-]{8,64}$/;
+/**
+ * Fixed words only: a name a repo or an agent chooses (a custom subagent's, an MCP tool's, a model alias) could carry
+ * words to Merle's agent, so each becomes one of these. Merle checks them against the same lists.
+ */
+export const TOOLS = [
+  'Bash',
+  'Read',
+  'Edit',
+  'MultiEdit',
+  'Write',
+  'Glob',
+  'Grep',
+  'WebFetch',
+  'WebSearch',
+  'Task',
+  'Agent',
+  'TodoWrite',
+  'NotebookEdit',
+  'ExitPlanMode',
+  'AskUserQuestion',
+  'Skill',
+  'shell',
+  'apply_patch',
+];
+export const AGENT_TYPES = ['general-purpose', 'Explore', 'Plan', 'statusline-setup', 'claude-code-guide'];
+const familyOf = (model) =>
+  typeof model === 'string' && model
+    ? (/(opus|sonnet|haiku|fable)/i.exec(model)?.[1]?.toLowerCase() ?? 'other')
+    : null;
+/** A subagent as Merle may know it: an opaque id made from its own (never its own), and a fixed type. */
+const subOf = (session, id) =>
+  `sub-${createHash('sha256').update(`${session}:${id}`).digest('hex').slice(0, 8)}`;
+const shortOf = (id) => id.replaceAll('-', '').slice(0, 8).toLowerCase();
+
+/**
+ * The command with each quoted string as one plain word, or null for shell it can't read safely (a quote left open, a
+ * heredoc): words inside quotes are never a command (Codex).
+ */
+export function bareOf(command) {
+  const bare = String(command ?? '')
+    .slice(0, 4000)
+    .replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, 'Q');
+  return /['"`]|<</.test(bare) ? null : bare;
+}
+/** A package manager's own work, never a test run however its arguments read ("pnpm add -D vitest"). */
+const MANAGE =
+  /^(?:add|i|install|ci|remove|rm|uninstall|un|update|up|upgrade|link|unlink|outdated|why|info|view|publish|dlx|create|init)$/;
+
+/** The commit, push, pull request or test run a shell command is, from each part's first words; never the words. */
+export function actsOf(command) {
+  const acts = new Set();
+  const bare = bareOf(command);
+  if (bare === null) return [];
+  for (const part of bare.split(/&&|\|\||;|\||\n/)) {
+    const w = part.trim().split(/\s+/);
+    while (w.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0])) w.shift(); // FOO=bar before it
+    if (w[0] === 'time' || w[0] === 'sudo' || w[0] === 'exec') w.shift();
+    const cmd = (w[0] ?? '').split('/').pop();
+    // A dry run or a help page does nothing (git push -n is a dry run; git commit -n isn't): Codex.
+    if (w.some((x) => /^(?:--dry-run|--help|-h|--version)$/.test(x))) continue;
+    if (cmd === 'git' && w.includes('push') && w.includes('-n')) continue;
+    // git's own options before its subcommand ("git -C dir push"): skipped, with their values.
+    let k = 1;
+    while (cmd === 'git' && w[k]?.startsWith('-')) k += w[k] === '-C' || w[k] === '-c' ? 2 : 1;
+    if (cmd === 'git' && (w[k] === 'commit' || w[k] === 'push')) acts.add(w[k]);
+    else if (cmd === 'gh' && w[1] === 'pr' && w[2] === 'create') acts.add('pr');
+    else if (/^(?:vitest|jest|pytest|playwright|merle-check|mocha|rspec|phpunit)$/.test(cmd))
+      acts.add('test');
+    else if (/^(?:pnpm|npm|yarn|bun|npx)$/.test(cmd)) {
+      const args = w.slice(1, 4);
+      const stop = args.findIndex((x) => MANAGE.test(x));
+      if (
+        (stop < 0 ? args : args.slice(0, stop)).some((x) =>
+          /^(?:test|check|vitest|jest|playwright|e2e)$/.test(x),
+        )
+      )
+        acts.add('test');
+    } else if (/^(?:cargo|go|make|mix|dotnet|swift)$/.test(cmd) && /^(?:test|check)$/.test(w[1] ?? ''))
+      acts.add('test');
+  }
+  return [...acts];
+}
+
+const int = (n, max) => (Number.isSafeInteger(n) && n >= 0 && n <= max ? n : undefined);
+
+/**
+ * Claude Code's hook input as one fact, or null for an event it says nothing about. The first adapter: another agent's
+ * hooks map their own events to the same facts.
+ */
+export function factOf(input, now = Date.now()) {
+  const session = input?.session_id;
+  if (typeof session !== 'string' || !SESSION.test(session)) return null;
+  const at = now;
+  // Each line its own id, so a batch sent again is kept once.
+  const base = { v: 1, id: randomBytes(6).toString('hex'), client: 'claude-code', session, at };
+  const agentId =
+    typeof input.agent_id === 'string' && input.agent_id.length > 0 ? input.agent_id.slice(0, 200) : null;
+  const agentType = AGENT_TYPES.includes(input.agent_type) ? input.agent_type : 'custom';
+  const agent = agentId ? { agent: { id: subOf(session, agentId), type: agentType } } : {};
+  const toolName = String(input.tool_name ?? '');
+  const tool = toolName.startsWith('mcp__') ? 'mcp' : TOOLS.includes(toolName) ? toolName : 'other';
+  switch (input.hook_event_name) {
+    case 'SessionStart':
+      return {
+        ...base,
+        e: 'start',
+        ...(['startup', 'resume', 'clear', 'compact', 'fork'].includes(input.source)
+          ? { source: input.source }
+          : {}),
+        ...(familyOf(input.model) ? { model: familyOf(input.model) } : {}),
+      };
+    case 'UserPromptSubmit':
+      return {
+        ...base,
+        ...agent,
+        e: 'prompt',
+        len: typeof input.prompt === 'string' ? Math.min(input.prompt.length, 1e7) : 0,
+      };
+    case 'PostToolUse':
+    case 'PostToolUseFailure': {
+      const ok = input.hook_event_name === 'PostToolUse';
+      // Only the first line of the error, only its number: "Exit code 1".
+      const code = ok
+        ? 0
+        : Number(/^Exit code (\d{1,3})\b/.exec(String(input.error ?? ''))?.[1] ?? Number.NaN);
+      const acts = tool === 'Bash' ? actsOf(input.tool_input?.command) : [];
+      // Sent to the background, it has only started: no exit code and no outcome yet (Codex).
+      const bg =
+        tool === 'Bash' &&
+        (input.tool_input?.run_in_background === true || input.tool_response?.backgroundTaskId != null);
+      // Joined by anything but && ("pnpm test || true", "a; b", "a | b"), the exit code is the last part's alone; a
+      // failed && chain doesn't say which part failed ("cd missing && pnpm test"): whether a test passed or a pull
+      // request was made isn't known (Codex).
+      const bare = bareOf(input.tool_input?.command) ?? '';
+      const mixed =
+        acts.length > 0 &&
+        (bg || /\|\||;|\||\n/.test(bare.replace(/&&/g, '')) || (!ok && bare.includes('&&')));
+      const ms = int(Math.round(Number(input.duration_ms ?? input.tool_response?.duration_ms)), 86_400_000);
+      return {
+        ...base,
+        ...agent,
+        e: 'tool',
+        tool,
+        ok,
+        ...(input.is_interrupt === true ? { stopped: true } : {}),
+        ...(tool === 'Bash' && !bg && Number.isSafeInteger(code) ? { exit: code } : {}),
+        ...(acts.length ? { acts } : {}),
+        ...(mixed ? { mixed: true } : {}),
+        ...(ms !== undefined ? { ms } : {}),
+      };
+    }
+    case 'Notification': {
+      const kind = { permission_prompt: 'permission', idle_prompt: 'idle', agent_needs_input: 'input' }[
+        input.notification_type
+      ];
+      return kind ? { ...base, ...agent, e: 'wait', kind } : null;
+    }
+    case 'Stop':
+      return { ...base, ...agent, e: 'stop' };
+    case 'SubagentStart':
+      return agentId ? { ...base, ...agent, e: 'sub_start' } : null;
+    case 'SubagentStop':
+      return agentId ? { ...base, ...agent, e: 'sub_stop' } : null;
+    case 'PreCompact':
+      return {
+        ...base,
+        e: 'compact',
+        ...(input.trigger === 'auto' || input.trigger === 'manual' ? { trigger: input.trigger } : {}),
+      };
+    case 'SessionEnd':
+      return {
+        ...base,
+        e: 'end',
+        ...(['clear', 'resume', 'logout', 'prompt_input_exit', 'other'].includes(input.reason)
+          ? { reason: input.reason }
+          : {}),
+      };
+    default:
+      return null;
+  }
+}
+
+/** Whether this Mac hooked the session up and it wasn't unhooked here (session-hook.mjs's record). */
+const hooked = (session) => {
+  try {
+    const v = JSON.parse(readFileSync(join(HOME, 'sessions', `${shortOf(session)}.json`), 'utf8'));
+    return !!v && typeof v === 'object' && v.session === session && v.unhooked !== true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Adds one fact to the spool, if there's room; a fact that should reach Merle now leaves the marker too. Only for a
+ * session this Mac hooked up, in a folder it still allows (`merle-runner deny` stops it at once).
+ */
+export async function spool(fact, cwd) {
+  if (!fact || !hooked(fact.session)) return false;
+  const { allowed } = await import('./session-hook.mjs');
+  if (typeof cwd !== 'string' || !allowed(cwd)) return false;
+  mkdirSync(SPOOL, { recursive: true, mode: 0o700 });
+  let size = 0;
+  try {
+    size = statSync(SPOOL_FILE).size;
+  } catch {}
+  const line = `${JSON.stringify(fact)}\n`;
+  if (size + line.length > SPOOL_MAX) return false;
+  appendFileSync(SPOOL_FILE, line, { mode: 0o600 });
+  if (fact.e === 'wait' || fact.e === 'end' || (fact.e === 'tool' && !fact.ok && fact.acts?.includes('test')))
+    appendFileSync(SPOOL_NOW, '', { mode: 0o600 });
+  return true;
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    const input = JSON.parse(readFileSync(0, 'utf8'));
+    await spool(factOf(input), input?.cwd);
+  } catch {}
+  process.exit(0);
+}

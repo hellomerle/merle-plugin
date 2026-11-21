@@ -382,8 +382,11 @@ export const ready = (input) => {
 };
 /** Checks the session in, and keeps its id on the Mac, so /merle unhook finds it however it first checked in. */
 const checkin = (pin, input, event, client) =>
-  postCheckin(pin, input, event, client).then((r) => {
+  postCheckin(pin, input, event, client).then(async (r) => {
     saveLocal(shortOf(input.session_id), { session: input.session_id });
+    // A session's first start: the event hook ran beside this one, before its record was here, and left nothing.
+    if (event === 'start')
+      await import('./event.mjs').then((e) => e.spool(e.factOf(input), input.cwd)).catch(() => false);
     return r;
   });
 const postCheckin = (pin, input, event, client) =>

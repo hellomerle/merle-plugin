@@ -29,6 +29,7 @@ import {
   rmSync,
   statSync,
   unlinkSync,
+  watch,
   writeFileSync,
 } from 'node:fs';
 import { homedir, hostname } from 'node:os';
@@ -728,6 +729,153 @@ const api = async (path, init = {}) => {
   return r;
 };
 
+// --- Session events (docs/sessions.md): what the hooks left on the spool (hooks/event.mjs), sent in batches. ---
+const SPOOL = join(HOME, 'spool');
+const SPOOL_FILE = join(SPOOL, 'events.jsonl');
+const SPOOL_NOW = join(SPOOL, 'now');
+/** The most a spool file holds (hooks/event.mjs SPOOL_MAX, and a line's room). */
+const SPOOL_FILE_MAX = 1024 * 1024 + 4096;
+const FACT_KEYS = new Set(
+  [
+    'v',
+    'id',
+    'client',
+    'session',
+    'at',
+    'e',
+    'agent',
+    'source',
+    'model',
+    'len',
+    'tool',
+    'ok',
+    'stopped',
+    'exit',
+  ].concat(['acts', 'mixed', 'ms', 'kind', 'trigger', 'reason']),
+);
+/**
+ * Whether a spool line is a fact as the hooks write it: only their keys, each a number, a short plain word, a boolean,
+ * a short list of words or the subagent's two; never a sentence. Merle checks each against its own lists again.
+ */
+export const isFact = (v) =>
+  !!v &&
+  typeof v === 'object' &&
+  !Array.isArray(v) &&
+  v.v === 1 &&
+  Object.entries(v).every(([k, x]) => {
+    if (!FACT_KEYS.has(k)) return false;
+    if (k === 'agent')
+      return (
+        !!x &&
+        typeof x === 'object' &&
+        Object.keys(x).length === 2 &&
+        /^sub-[0-9a-f]{8}$/.test(x.id) &&
+        /^[\w-]{1,20}$/.test(x.type)
+      );
+    if (k === 'acts') return Array.isArray(x) && x.length <= 4 && x.every((a) => /^[a-z]{2,6}$/.test(a));
+    return (
+      typeof x === 'boolean' ||
+      (typeof x === 'number' && Number.isFinite(x)) ||
+      (typeof x === 'string' && /^[\w.:-]{1,64}$/.test(x))
+    );
+  });
+/** Batches waiting to go: past this many, the oldest goes unsent, so a Mac that can't reach Merle never fills up. */
+const SENDING_MAX = 4;
+const BATCH = 200;
+/** How often the spool goes at most, unless a hook asked for now: the runner's look for jobs is its clock. */
+export const FLUSH_MS = 30_000;
+let flushed = 0;
+let heard = 0;
+let flushing = null;
+/**
+ * Takes the spool as it is (a rename, so the hooks go on writing a fresh one) and sends it, with any batch a failed
+ * send left, in batches of 200 lines. A line that isn't JSON is left out; Merle checks every line again. What Merle
+ * took is deleted; what it didn't, or couldn't, waits for the next time.
+ */
+export function flushEvents(now = Date.now(), force = false) {
+  if (flushing) return flushing;
+  let asked = false;
+  try {
+    statSync(SPOOL_NOW);
+    asked = true;
+  } catch {}
+  if (!force && !asked && now - flushed < FLUSH_MS) return Promise.resolve(0);
+  flushed = now;
+  // Cleared once the send is over, never inside it: one that ends without waiting on anything would clear it before
+  // it was set, and every later send would answer with that one.
+  const sending = (async () => {
+    {
+      rmSync(SPOOL_NOW, { force: true });
+      try {
+        renameSync(SPOOL_FILE, join(SPOOL, `sending-${now}.jsonl`));
+      } catch {}
+      let names = [];
+      try {
+        names = readdirSync(SPOOL)
+          .filter((n) => /^sending-\d{1,16}\.jsonl$/.test(n))
+          .sort((a, b) => Number(a.slice(8, -6)) - Number(b.slice(8, -6)));
+      } catch {
+        return 0;
+      }
+      // Nothing to send for 5 minutes: an empty batch anyway, so Merle finds a session that went quiet while working
+      // (a stall) with nothing else from this Mac.
+      if (!names.length && now - heard >= 5 * 60_000) {
+        heard = now;
+        await api('/v1/runner/hook/events', { method: 'POST', body: '{"events":[]}' });
+        return 0;
+      }
+      for (const n of names.slice(0, Math.max(0, names.length - SENDING_MAX)))
+        rmSync(join(SPOOL, n), { force: true });
+      let sent = 0;
+      for (const n of names.slice(-SENDING_MAX)) {
+        // Only a file the hooks could have written: a plain one, no link, no bigger than the spool may grow. Anything
+        // else in the folder (a link to a transcript, say) is never read, and goes.
+        const at = join(SPOOL, n);
+        const st = lstatSync(at);
+        if (!st.isFile() || st.size > SPOOL_FILE_MAX) {
+          rmSync(at, { force: true });
+          continue;
+        }
+        const lines = readFileSync(at, 'utf8')
+          .split('\n')
+          .flatMap((l) => {
+            try {
+              const v = JSON.parse(l);
+              return isFact(v) ? [v] : [];
+            } catch {
+              return [];
+            }
+          });
+        for (let k = 0; k < lines.length; k += BATCH) {
+          const r = await api('/v1/runner/hook/events', {
+            method: 'POST',
+            body: JSON.stringify({ events: lines.slice(k, k + BATCH) }),
+          });
+          // Too many this hour, or lines Merle refused: what's left of this batch goes, never sent again.
+          if (!r.ok && r.status !== 400 && r.status !== 413 && r.status !== 429) return sent;
+          sent += Math.min(BATCH, lines.length - k);
+          heard = now;
+        }
+        rmSync(join(SPOOL, n), { force: true });
+      }
+      return sent;
+    }
+  })();
+  flushing = sending.finally(() => {
+    flushing = null;
+  });
+  return flushing;
+}
+/** A hook asked for now (waiting at the Mac, a session ending, a failed test): send at once, not at the next look. */
+function watchSpool() {
+  try {
+    mkdirSync(SPOOL, { recursive: true, mode: 0o700 });
+    watch(SPOOL, (_, name) => {
+      if (name === 'now') void flushEvents(Date.now()).catch(() => {});
+    });
+  } catch {}
+}
+
 // --- Pause (docs/sessions.md): a hooked-up session's pause from Merle, as a file of its own on this Mac. ---
 /** Where the session hooks keep each session's own record (session-hook.mjs), and where its pause file goes. */
 export const SESSIONS = join(HOME, 'sessions');
@@ -1263,6 +1411,8 @@ export async function tick(now = Date.now()) {
       lastReport = now;
       await report();
     }
+    // What the sessions' hooks left on the spool, every half minute at most; a failed send waits for the next one.
+    await flushEvents(now).catch(() => 0);
     const c = config();
     // Paused: no new jobs, only stops, every half minute. Full: the same every quarter minute, not a busy loop.
     if (c.paused) {
@@ -1284,6 +1434,7 @@ export async function tick(now = Date.now()) {
 
 async function run() {
   log({ event: 'runner started' }); // throws if the log can't be written: nothing runs without it
+  watchSpool();
   for (;;) {
     const wait = await tick();
     if (wait) await sleep(wait);
