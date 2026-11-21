@@ -227,6 +227,18 @@
           }
         ]
       }
+    ],
+    "TeammateIdle": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/event.mjs\"",
+            "async": true,
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

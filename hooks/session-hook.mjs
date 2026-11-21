@@ -784,17 +784,28 @@ async function signing(on) {
   return 0;
 }
 
+/**
+ * Fired inside a subagent or an in-process teammate (Claude Code's `agent_id`): its hooks carry the session's own id, so
+ * a note the founder sent the session must never land in one of them. Only the session's main thread takes notes.
+ */
+const insideAgent = (input) => typeof input?.agent_id === 'string' && input.agent_id.length > 0;
+
 async function main([cmd, arg]) {
   switch (cmd) {
     case 'start':
     case 'next-note': {
       // No word after it: Claude Code's plugin. Codex or Cursor: merle-runner hooks wrote it. Anything else does nothing.
       if (arg !== undefined && !OTHER_CLIENTS.includes(arg)) return 0;
-      const input = inputOf(readInput(), arg);
+      const raw = readInput();
+      // Claude Code's field: another client's input with the same name never holds back the session's note.
+      if (cmd === 'next-note' && arg === undefined && insideAgent(raw)) return 0;
+      const input = inputOf(raw, arg);
       return cmd === 'start' ? start(input, arg) : nextNote(input, arg);
     }
-    case 'wait':
-      return wait(readInput());
+    case 'wait': {
+      const input = readInput();
+      return insideAgent(input) ? 0 : wait(input);
+    }
     case 'waiting':
       return waiting(readInput());
     case 'unhook':

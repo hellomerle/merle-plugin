@@ -187,6 +187,9 @@ export function factOf(input, now = Date.now()) {
       return agentId ? { ...base, ...agent, e: 'sub_start' } : null;
     case 'SubagentStop':
       return agentId ? { ...base, ...agent, e: 'sub_stop' } : null;
+    // An in-process teammate's turn ends with TeammateIdle (SubagentStart opens each one): its own stop, by its own id.
+    case 'TeammateIdle':
+      return agentId ? { ...base, ...agent, e: 'stop' } : null;
     case 'PreCompact':
       return {
         ...base,
