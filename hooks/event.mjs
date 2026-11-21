@@ -66,8 +66,11 @@ const familyOf = (model) =>
     ? (/(opus|sonnet|haiku|fable)/i.exec(model)?.[1]?.toLowerCase() ?? 'other')
     : null;
 /** A subagent as Merle may know it: an opaque id made from its own (never its own), and a fixed type. */
-const subOf = (session, id) =>
-  `sub-${createHash('sha256').update(`${session}:${id}`).digest('hex').slice(0, 8)}`;
+export const subOf = (session, id) =>
+  `sub-${createHash('sha256')
+    .update(`${session}:${String(id).slice(0, 200)}`)
+    .digest('hex')
+    .slice(0, 8)}`;
 const shortOf = (id) => id.replaceAll('-', '').slice(0, 8).toLowerCase();
 
 /**

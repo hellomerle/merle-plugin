@@ -137,10 +137,13 @@ const NOTE_KEYS = new Set([
   'paired',
   'text',
   'refs',
+  'agent',
   'created',
   'expires',
   'nonce',
 ]);
+/** A teammate's row key (event.mjs subOf): a note naming one goes to that teammate's own hooks and no other. */
+const AGENT_KEY = /^sub-[0-9a-f]{8}$/;
 /** Seconds Merle holds one look open; the waiting hook looks again at once after. */
 const WAIT = Math.max(1, Math.min(25, Number(process.env.MERLE_HOOK_WAIT) || 25));
 /** A note waits a day for a sleeping Mac (sessions.ts NOTE_MS), plus a few minutes for clocks apart. */
@@ -293,7 +296,7 @@ export const api = async (pin, path, init = {}, ms = 10_000) => {
 };
 
 /** Why this Mac won't take a note, or null. */
-export function refusalOf(note, a, pin, { session, requireSigned, now }) {
+export function refusalOf(note, a, pin, { session, agent = null, requireSigned, now }) {
   if (!note || note.v !== 1) return 'version';
   if (note.type !== 'note') return 'type';
   if (Object.keys(note).some((k) => !NOTE_KEYS.has(k))) return 'keys';
@@ -307,10 +310,13 @@ export function refusalOf(note, a, pin, { session, requireSigned, now }) {
     /^[A-Za-z0-9_-]{1,60}$/.test(note.from) &&
     typeof note.paired === 'boolean' &&
     Array.isArray(note.refs) &&
-    note.refs.every((r) => typeof r === 'string' && /^R-\d{1,9}$/.test(r));
+    note.refs.every((r) => typeof r === 'string' && /^R-\d{1,9}$/.test(r)) &&
+    (note.agent === undefined || (typeof note.agent === 'string' && AGENT_KEY.test(note.agent)));
   if (!shape) return 'shape';
   if (note.runner !== pin.runner) return 'runner';
   if (note.session !== session) return 'session';
+  // A teammate's note only in that teammate's own hook; the session's own only in its main thread.
+  if ((note.agent ?? null) !== agent) return 'agent';
   const fresh =
     note.created <= now + 60_000 && now < note.expires && note.expires - note.created <= NOTE_MS + MARGIN_MS;
   if (!fresh) return 'expired';
@@ -345,7 +351,7 @@ export function noteText(note, { short, worktree, host, signed, prompts }) {
     } Note ${note.id}, sent by ${from}, signed in to Merle.${
       signed ? ' Signed with Touch ID on the passkey this Mac pinned.' : ''
     }`,
-    `For session ${short} (${plain(worktree)}) on ${plain(host)}.`,
+    `For session ${short} (${plain(worktree)}) on ${plain(host)}.${note.agent ? ' For this teammate only.' : ''}`,
     '',
     plain(note.text),
     ...(note.kind === 'approved'
@@ -369,8 +375,10 @@ export function noteText(note, { short, worktree, host, signed, prompts }) {
   ].join('\n');
 }
 
+/** What the hook still tells Merle once it has printed: refusals, waited for before it ends. */
+const afterOutput = [];
 /** Checks each note, logs each, tells Merle which it refused, and returns the words of those it took. */
-async function take(pin, notes, input, by) {
+async function take(pin, notes, input, by, agent = null) {
   const now = Date.now();
   const requireSigned = required();
   const me = { short: shortOf(input.session_id), worktree: worktreeOf(input.cwd), host: hostname() };
@@ -381,7 +389,7 @@ async function take(pin, notes, input, by) {
       // Unhooked here while the look was open: refused, whatever Merle handed over.
       why = unhookedHere(input)
         ? 'unhooked'
-        : refusalOf(note, assertion, pin, { session: input.session_id, requireSigned, now });
+        : refusalOf(note, assertion, pin, { session: input.session_id, agent, requireSigned, now });
       // Taken once on this Mac: the check and the record under one lock, whichever hook or process asks.
       if (!why && assertion && !noteNonces.take(note.nonce, note.expires, now)) why = 'replayed';
     } catch {
@@ -397,11 +405,15 @@ async function take(pin, notes, input, by) {
       ...(why ? { reason: why } : {}),
     });
     if (why) {
+      // Told after the good notes are printed (the hook waits for it before it ends): a slow Merle never holds back,
+      // past Claude Code's timeout, a note it already marked delivered (the second pass).
       if (typeof note?.id === 'string' && NOTE_ID.test(note.id))
-        await api(pin, `/v1/runner/hook/notes/${note.id}/refused`, {
-          method: 'POST',
-          body: JSON.stringify({ reason: why }),
-        }).catch(() => {});
+        afterOutput.push(
+          api(pin, `/v1/runner/hook/notes/${note.id}/refused`, {
+            method: 'POST',
+            body: JSON.stringify({ reason: why }),
+          }).catch(() => {}),
+        );
       continue;
     }
     out.push(noteText(note, { ...me, signed: !!assertion, prompts: prompts(input) }));
@@ -448,6 +460,8 @@ const postCheckin = (pin, input, event, client) =>
       // Claude Code's plugin holds the pause gate (pause-gate.mjs, its PreToolUse hook): Merle offers Pause only then.
       // And whether this session's pause file is here, by the rev in it, so Merle never disagrees with the Mac for long.
       ...(client === undefined ? { gate: true, paused: pausedRev(input.session_id) } : {}),
+      // And its own teammates' hooks take a note to one of them (agent-note): only Claude Code's plugin has them.
+      ...(client === undefined ? { notes: 2 } : {}),
     }),
   });
 
@@ -673,6 +687,29 @@ async function nextNote(input, client) {
   return 0;
 }
 
+/**
+ * A note to one teammate, in that teammate's own hooks (Claude Code's SubagentStart and SubagentStop, fired with its
+ * `agent_id`): asked for by its key alone, so the session's own notes and another teammate's never come, and checked as
+ * any note, its key included. As it takes a message, it's context; as it ends a turn, it's its next instruction.
+ */
+async function agentNote(input) {
+  const pin = ready(input);
+  if (!pin || !logWritable() || unhookedHere(input)) return 0;
+  const { subOf } = await import('./event.mjs');
+  const agent = subOf(input.session_id, input.agent_id);
+  const got = await api(pin, `/v1/runner/hook/notes?session=${input.session_id}&agent=${agent}&wait=0`);
+  ratchet(got.signed);
+  const words = await take(pin, got.notes ?? [], input, 'agent', agent);
+  if (!words.length) return 0;
+  const text = words.join('\n\n---\n\n');
+  const out =
+    input.hook_event_name === 'SubagentStart'
+      ? { hookSpecificOutput: { hookEventName: 'SubagentStart', additionalContext: text } }
+      : { decision: 'block', reason: text };
+  process.stdout.write(`${JSON.stringify(out)}\n`);
+  return 0;
+}
+
 /** One waiter per session: the newest. An older one sees the pid file name another and ends. */
 async function wait(input) {
   const pin = ready(input);
@@ -844,6 +881,13 @@ async function main([cmd, arg]) {
       const input = inputOf(raw, arg);
       return cmd === 'start' ? start(input, arg) : nextNote(input, arg);
     }
+    case 'agent-note': {
+      // Claude Code's plugin only, and only inside a teammate or a subagent: anything else asks for nothing.
+      if (arg !== undefined) return 0;
+      const input = readInput();
+      const e = input?.hook_event_name;
+      return insideAgent(input) && (e === 'SubagentStart' || e === 'SubagentStop') ? agentNote(input) : 0;
+    }
     case 'wait': {
       const input = readInput();
       return insideAgent(input) ? 0 : wait(input);
@@ -869,7 +913,12 @@ async function main([cmd, arg]) {
 
 // A hook that fails says nothing and lets the session go on: the note waits in Merle for the next turn.
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))
-  main(process.argv.slice(2)).then(
-    (code) => process.exit(code ?? 0),
-    () => process.exit(0),
-  );
+  main(process.argv.slice(2))
+    .then(async (code) => {
+      await Promise.all(afterOutput);
+      return code;
+    })
+    .then(
+      (code) => process.exit(code ?? 0),
+      () => process.exit(0),
+    );
