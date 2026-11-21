@@ -37,7 +37,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { hostname } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import {
@@ -52,6 +52,7 @@ import {
   passkeySays,
   pausedRev,
   LOG as RUNNER_LOG,
+  repoFor,
   signedBy,
   signingRequired,
 } from '../runner/merle-runner.mjs';
@@ -165,23 +166,6 @@ const OTHER_CLIENTS = ['codex', 'cursor'];
 const git = (cwd, args) => {
   const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   return r.status === 0 ? r.stdout.trim() : '';
-};
-const remoteIn = (cwd) => {
-  const m = /github\.com[:/]([\w.-]+\/[\w.-]+?)(\.git)?$/.exec(git(cwd, ['remote', 'get-url', 'origin']));
-  return m ? `github.com/${m[1]}` : null;
-};
-/** A folder the Mac allowed (merle-runner allow), or under one, or a worktree of an allowed repo. */
-/** The allowed repo this folder is (merle-runner allow): under its path, or a worktree with its git remote; or null. */
-const repoFor = (cwd) => {
-  const { repos = [] } = config();
-  const here = resolve(cwd);
-  // The most specific folder wins: /repos/suite/mobile over /repos/suite, whatever order they were allowed in.
-  const byPath = repos
-    .filter((r) => typeof r.path === 'string' && (here === r.path || here.startsWith(r.path + sep)))
-    .sort((a, b) => b.path.length - a.path.length)[0];
-  if (byPath) return byPath;
-  const remote = remoteIn(here);
-  return (remote && repos.find((r) => r.remote === remote)) || null;
 };
 export const allowed = (cwd) => !!repoFor(cwd);
 /**
@@ -436,7 +420,11 @@ export const ready = (input) => {
 /** Checks the session in, and keeps its id on the Mac, so /merle unhook finds it however it first checked in. */
 const checkin = (pin, input, event, client) =>
   postCheckin(pin, input, event, client).then(async (r) => {
-    saveLocal(shortOf(input.session_id), { session: input.session_id });
+    // Its folder too, kept here only: the runner checks reading's folder rules again before a name leaves.
+    saveLocal(shortOf(input.session_id), {
+      session: input.session_id,
+      ...(input.cwd ? { cwd: input.cwd } : {}),
+    });
     // A session's first start: the event hook ran beside this one, before its record was here, and left nothing.
     if (event === 'start')
       await import('./event.mjs').then((e) => e.spool(e.factOf(input), input.cwd)).catch(() => false);
@@ -498,7 +486,7 @@ async function start(input, client) {
   ratchet(r.signed);
   if (!r.hooked) return 0;
   const short = shortOf(input.session_id);
-  saveLocal(short, { session: input.session_id });
+  saveLocal(short, { session: input.session_id, ...(input.cwd ? { cwd: input.cwd } : {}) });
   if (unhookedHere(input)) return 0;
   const context = [
     `This session is hooked up to Merle as session ${short} on ${plain(hostname())}.`,

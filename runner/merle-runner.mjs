@@ -33,7 +33,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -601,6 +601,27 @@ const startedKeep = (id, rec) => {
   renameSync(tmp, JOBS);
 };
 
+const gitOut = (cwd, args) => {
+  const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  return r.status === 0 ? r.stdout.trim() : '';
+};
+const remoteIn = (cwd) => {
+  const m = /github\.com[:/]([\w.-]+\/[\w.-]+?)(\.git)?$/.exec(gitOut(cwd, ['remote', 'get-url', 'origin']));
+  return m ? `github.com/${m[1]}` : null;
+};
+/** A folder the Mac allowed (merle-runner allow), or under one, or a worktree of an allowed repo. */
+/** The allowed repo this folder is (merle-runner allow): under its path, or a worktree with its git remote; or null. */
+export const repoFor = (cwd) => {
+  const { repos = [] } = config();
+  const here = resolve(cwd);
+  // The most specific folder wins: /repos/suite/mobile over /repos/suite, whatever order they were allowed in.
+  const byPath = repos
+    .filter((r) => typeof r.path === 'string' && (here === r.path || here.startsWith(r.path + sep)))
+    .sort((a, b) => b.path.length - a.path.length)[0];
+  if (byPath) return byPath;
+  const remote = remoteIn(here);
+  return (remote && repos.find((r) => r.remote === remote)) || null;
+};
 export const config = () => {
   try {
     return { repos: [], max: 3, paused: false, ...JSON.parse(readFileSync(CONFIG, 'utf8')) };
@@ -827,7 +848,10 @@ export const isFact = (v, now = Date.now()) => {
         !!x &&
         typeof x === 'object' &&
         !Array.isArray(x) &&
-        Object.keys(x).length === 2 &&
+        Object.keys(x).every((y) => y === 'id' || y === 'type' || y === 'name') &&
+        // Its name, only while this Mac reads its sessions (flushEvents takes it off otherwise): one line, 80 at most.
+        (x.name === undefined ||
+          (typeof x.name === 'string' && x.name.length <= 80 && !/\p{Cc}/u.test(x.name))) &&
         typeof x.id === 'string' &&
         /^sub-[0-9a-f]{8}$/.test(x.id) &&
         FACT_WORDS.agent_type.includes(x.type)
@@ -846,19 +870,33 @@ export const isFact = (v, now = Date.now()) => {
  * never leaves, so a session id can't carry words either.
  */
 const hookedHere = (session, seen = new Map()) => {
-  if (seen.has(session)) return seen.get(session);
-  const ok = readHooked(session);
-  seen.set(session, ok);
-  return ok;
+  if (seen.has(session)) return !!seen.get(session);
+  const rec = readHooked(session);
+  seen.set(session, rec);
+  return !!rec;
 };
 const readHooked = (session) => {
   try {
     const short = session.replaceAll('-', '').slice(0, 8).toLowerCase();
     const r = JSON.parse(readFileSync(join(HOME, 'sessions', `${short}.json`), 'utf8'));
-    return !!r && typeof r === 'object' && r.session === session && r.unhooked !== true;
+    return r && typeof r === 'object' && r.session === session && r.unhooked !== true ? r : null;
   } catch {
-    return false;
+    return null;
   }
+};
+/**
+ * Whether an agent's name on this line may leave now: reading on since before it was written, and both the folder its
+ * hook ran in (`here`, kept on this Mac only) and its session's (its record here) ones reading still reads: allowed
+ * since before it, and not left out. Anything unknown: no.
+ */
+const nameMayLeave = (v, here, rec, since) => {
+  if (since === null || !(v.at >= since)) return false;
+  for (const cwd of [here, rec?.cwd]) {
+    if (typeof cwd !== 'string' || !isAbsolute(cwd)) return false;
+    const repo = repoFor(cwd);
+    if (!repo || readingLeftOut(cwd) || (Number.isSafeInteger(repo.at) && repo.at > v.at)) return false;
+  }
+  return true;
 };
 /** Sessions a batch may name at most, as Merle takes them: a backlog of more goes in more batches (Codex). */
 const SESSIONS_A_BATCH = 50;
@@ -921,12 +959,16 @@ export function flushEvents(now = Date.now(), force = false) {
         }
         // Each session looked up once a file (its record on the Mac).
         const seen = new Map();
+        // `here`, the folder a named line's hook ran in, stays on this Mac: taken off before anything else reads it.
+        const wheres = new Map();
         const lines = readFileSync(at, 'utf8')
           .split('\n')
           .flatMap((l) => {
             try {
-              const v = JSON.parse(l);
-              return isFact(v, now) && hookedHere(v.session, seen) ? [v] : [];
+              const { here, ...v } = JSON.parse(l);
+              if (!isFact(v, now) || !hookedHere(v.session, seen)) return [];
+              wheres.set(v, here);
+              return [v];
             } catch {
               return [];
             }
@@ -947,6 +989,12 @@ export function flushEvents(now = Date.now(), force = false) {
           }
         }
         for (const b of batches) {
+          // An agent's name leaves only while reading is still on as this batch goes, only one written since it went
+          // on, and only for folders it still reads: an off or a folder left out typed meanwhile wins.
+          const since = readingSince();
+          for (const v of b.lines)
+            if (v.agent?.name !== undefined && !nameMayLeave(v, wheres.get(v), seen.get(v.session), since))
+              delete v.agent.name;
           const r = await api('/v1/runner/hook/events', {
             method: 'POST',
             body: JSON.stringify({ events: b.lines }),

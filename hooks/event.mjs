@@ -6,7 +6,9 @@
  * Facts only, the same whatever coding agent sends them: which event, when, and counts or fixed words. Never what the
  * person typed (a prompt is its length), never a tool's input or output (a tool is its name, whether it worked and its
  * exit code), never a command (a commit, a push, a pull request or a test run is read from the command's first words
- * and named by a fixed word), never a path. A subagent is its id and type, so each builder is its own row in Merle.
+ * and named by a fixed word), never a path (a line with an agent's name keeps its hook's folder in the spool, for the
+ * runner to check again, and the runner takes it off before sending). A subagent is its id and type, so each builder
+ * is its own row in Merle.
  *
  * Only for a session this Mac hooked up (session-hook.mjs left its record), and the spool never grows past SPOOL_MAX:
  * past it, events are left out until the runner has sent what's there.
@@ -16,6 +18,8 @@ import { appendFileSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { settings } from '../runner/reading.mjs';
+import { scrubber } from '../runner/scrub.mjs';
 
 const HOME = process.env.MERLE_RUNNER_HOME ?? join(homedir(), 'Library', 'Application Support', 'Merle');
 export const SPOOL = join(HOME, 'spool');
@@ -122,7 +126,7 @@ const int = (n, max) => (Number.isSafeInteger(n) && n >= 0 && n <= max ? n : und
  * Claude Code's hook input as one fact, or null for an event it says nothing about. The first adapter: another agent's
  * hooks map their own events to the same facts.
  */
-export function factOf(input, now = Date.now()) {
+export function factOf(input, now = Date.now(), o = { names: false }) {
   const session = input?.session_id;
   if (typeof session !== 'string' || !SESSION.test(session)) return null;
   const at = now;
@@ -132,6 +136,26 @@ export function factOf(input, now = Date.now()) {
     typeof input.agent_id === 'string' && input.agent_id.length > 0 ? input.agent_id.slice(0, 200) : null;
   const agentType = AGENT_TYPES.includes(input.agent_type) ? input.agent_type : 'custom';
   const agent = agentId ? { agent: { id: subOf(session, agentId), type: agentType } } : {};
+  // Its own name, for its row: only while this Mac reads its sessions (`o.names`: reading on with Touch ID, its folder
+  // read), since it is words the lead wrote into its Agent call; scrubbed as reading's words are, 80 at most; on its
+  // start and its going idle only (the founder, 21 Nov; CLAUDE.md non-negotiable 3).
+  const said = o.names
+    ? [input.agent_type, input.teammate_name].find((x) => typeof x === 'string' && x.trim())
+    : null;
+  const sc = said ? scrubber() : null;
+  // As reading renders words: quoted or indented code stays on the Mac (a backtick, a ~~~ fence, a line indented four
+  // or a tab), settings are cut to their names, then scrubbed and folded to one line (the second pass).
+  const raw = said ? String(said).slice(0, 400) : '';
+  const code = /`|~~~|^ {4}|\t/m.test(raw);
+  const name =
+    sc && !code
+      ? sc
+          .plain(sc.text(settings(raw)))
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 80)
+      : '';
+  const named = agentId ? { agent: { ...agent.agent, ...(name ? { name } : {}) } } : {};
   const toolName = String(input.tool_name ?? '');
   const tool = toolName.startsWith('mcp__') ? 'mcp' : TOOLS.includes(toolName) ? toolName : 'other';
   switch (input.hook_event_name) {
@@ -196,12 +220,12 @@ export function factOf(input, now = Date.now()) {
     case 'Stop':
       return { ...base, ...agent, e: 'stop' };
     case 'SubagentStart':
-      return agentId ? { ...base, ...agent, e: 'sub_start' } : null;
+      return agentId ? { ...base, ...named, e: 'sub_start' } : null;
     case 'SubagentStop':
       return agentId ? { ...base, ...agent, e: 'sub_stop' } : null;
     // An in-process teammate's turn ends with TeammateIdle (SubagentStart opens each one): its own stop, by its own id.
     case 'TeammateIdle':
-      return agentId ? { ...base, ...agent, e: 'stop' } : null;
+      return agentId ? { ...base, ...named, e: 'stop' } : null;
     case 'PreCompact':
       return {
         ...base,
@@ -242,7 +266,8 @@ export async function spool(fact, cwd) {
   try {
     size = statSync(SPOOL_FILE).size;
   } catch {}
-  const line = `${JSON.stringify(fact)}\n`;
+  // A named line keeps the folder its hook ran in, for the runner to check again when it sends; never sent.
+  const line = `${JSON.stringify(fact.agent?.name ? { ...fact, here: cwd } : fact)}\n`;
   if (size + line.length > SPOOL_MAX) return false;
   appendFileSync(SPOOL_FILE, line, { mode: 0o600 });
   if (fact.e === 'wait' || fact.e === 'end' || (fact.e === 'tool' && !fact.ok && fact.acts?.includes('test')))
@@ -250,10 +275,47 @@ export async function spool(fact, cwd) {
   return true;
 }
 
+/**
+ * What reading.jsonl keeps of an agent's name that left (docs/sessions.md, Session reading): that one did, its
+ * session's short id, its hash and its length, never the words, so the person can see words left the Mac.
+ */
+export function nameLog(fact, log) {
+  const name = fact?.agent?.name;
+  if (typeof name !== 'string' || !name) return;
+  log({
+    event: 'agent_name',
+    session: shortOf(fact.session),
+    sha256: createHash('sha256').update(name).digest('hex'),
+    chars: name.length,
+  });
+}
+
+/**
+ * The fact for a hook's input, with its agent's name only while this Mac reads its sessions (`r`, the runner) and only
+ * once its line in reading.jsonl is written: a log it can't write, and no name goes (as reading does).
+ */
+export function namedFact(input, now, r) {
+  const names = !!r && r.readingOn() && !r.readingLeftOut(input?.cwd);
+  const fact = factOf(input, now, { names });
+  if (fact?.agent?.name)
+    try {
+      nameLog(fact, r.readingLog);
+    } catch {
+      delete fact.agent.name;
+    }
+  return fact;
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const input = JSON.parse(readFileSync(0, 'utf8'));
-    await spool(factOf(input), input?.cwd);
+    // An agent's name goes only with its start and its going idle, and only while this Mac reads its sessions.
+    const r =
+      input?.hook_event_name === 'SubagentStart' || input?.hook_event_name === 'TeammateIdle'
+        ? await import('../runner/merle-runner.mjs').catch(() => null)
+        : null;
+    const fact = namedFact(input, Date.now(), r);
+    await spool(fact, input?.cwd);
   } catch {}
   process.exit(0);
 }
