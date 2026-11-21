@@ -37,7 +37,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { hostname } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import {
@@ -67,6 +67,55 @@ const PLUGIN_VERSION = (() => {
       ),
     ).version;
     return typeof v === 'string' && /^\d{1,4}\.\d{1,4}\.\d{1,6}$/.test(v) ? v : undefined;
+  } catch {
+    return undefined;
+  }
+})();
+/**
+ * Every file the hooks run, by its path in the plugin, in order: each .mjs and .json in the hooks folder, and every file
+ * they import by a relative path (the runner, reading, the scrubber, a skill), followed to the end.
+ */
+export function hooksFilesOf(dir) {
+  const root = resolve(dir, '..');
+  const seen = new Set();
+  const next = readdirSync(dir)
+    .filter((n) => /\.(?:mjs|json)$/.test(n))
+    .map((n) => join(dir, n));
+  while (next.length) {
+    const f = resolve(next.pop());
+    if (seen.has(f)) continue;
+    seen.add(f);
+    if (!f.endsWith('.mjs')) continue;
+    for (const m of readFileSync(f, 'utf8').matchAll(
+      /(?:\bfrom\s*|\bimport\s*\(?\s*)['"`](\.{1,2}\/[^'"`]+)['"`]/g,
+    ))
+      if (m[1]) next.push(resolve(dirname(f), m[1]));
+  }
+  return [...seen]
+    .map((f) => {
+      const rel = relative(root, f);
+      if (rel.startsWith('..') || isAbsolute(rel)) throw new Error('a hook runs a file outside the plugin');
+      return rel;
+    })
+    .sort();
+}
+/**
+ * Everything the hooks run, as one hash: the first 16 hex of a SHA-256 over each of those files by its path in the
+ * plugin. Merle asks for an update only when it differs from the one it published, never just because the plugin's
+ * version moved. deploy.sh works out the published one with this same function.
+ */
+export function hooksShaOf(dir) {
+  const root = resolve(dir, '..');
+  const h = createHash('sha256');
+  for (const f of hooksFilesOf(dir))
+    h.update(`${f}\0`)
+      .update(readFileSync(join(root, f)))
+      .update('\0');
+  return h.digest('hex').slice(0, 16);
+}
+const HOOKS_SHA = (() => {
+  try {
+    return hooksShaOf(dirname(fileURLToPath(import.meta.url)));
   } catch {
     return undefined;
   }
@@ -407,6 +456,7 @@ const postCheckin = (pin, input, event, client) =>
       ...(OTHER_CLIENTS.includes(client) ? { client } : {}),
       // Claude Code's plugin only: Codex and Cursor run these hooks from Merle's download, with no plugin to update.
       ...(PLUGIN_VERSION && client === undefined ? { plugin: PLUGIN_VERSION } : {}),
+      ...(HOOKS_SHA && client === undefined ? { hooks: HOOKS_SHA } : {}),
       // Claude Code's plugin holds the pause gate (pause-gate.mjs, its PreToolUse hook): Merle offers Pause only then.
       // And whether this session's pause file is here, by the rev in it, so Merle never disagrees with the Mac for long.
       ...(client === undefined ? { gate: true, paused: pausedRev(input.session_id) } : {}),
