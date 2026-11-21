@@ -103,6 +103,19 @@ export const canonical = (job) =>
   );
 const b64 = (s) => Buffer.from(String(s), 'base64url');
 const sha256 = (b) => createHash('sha256').update(b).digest();
+/**
+ * Which runner this is: the first 16 of this file's own SHA-256, as installed (install copies it byte for byte). Each
+ * look for jobs says it, so Merle can say when a Mac's runner is behind the one it published.
+ */
+const SELF = (() => {
+  try {
+    return sha256(readFileSync(fileURLToPath(import.meta.url)))
+      .toString('hex')
+      .slice(0, 16);
+  } catch {
+    return null;
+  }
+})();
 
 /**
  * Why a job is refused, or null when it may run. In order: what it is, whose it is, that the pinned passkey signed
@@ -1294,11 +1307,14 @@ export async function once(now = Date.now(), wait = 25) {
   // Which products this Mac allows, so Merle offers its one key only for those (docs/loop.md). Ids only, no folders.
   const products = [...new Set(c.repos.map((r) => r.product))].join(',');
   const got = await (
-    await api(`/v1/runner/jobs?wait=${wait}&limit=${room}&v=4&products=${encodeURIComponent(products)}`, {
-      // Its wait and a full minute more: Merle marks a stop or a job delivered before it answers, so a look given up
-      // too soon could lose one. A reply lost on the way (the connection or the Worker gone) still can, as before.
-      signal: AbortSignal.timeout((wait + 60) * 1000),
-    })
+    await api(
+      `/v1/runner/jobs?wait=${wait}&limit=${room}&v=4&products=${encodeURIComponent(products)}${SELF ? `&runner=${SELF}` : ''}`,
+      {
+        // Its wait and a full minute more: Merle marks a stop or a job delivered before it answers, so a look given up
+        // too soon could lose one. A reply lost on the way (the connection or the Worker gone) still can, as before.
+        signal: AbortSignal.timeout((wait + 60) * 1000),
+      },
+    )
   ).json();
   const jobs = Array.isArray(got?.jobs) ? got.jobs : [];
   const done = [];
