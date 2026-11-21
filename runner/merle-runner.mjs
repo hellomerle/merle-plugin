@@ -860,6 +860,8 @@ const readHooked = (session) => {
     return false;
   }
 };
+/** Sessions a batch may name at most, as Merle takes them: a backlog of more goes in more batches (Codex). */
+const SESSIONS_A_BATCH = 50;
 /** Batches waiting to go: past this many, the oldest goes unsent, so a Mac that can't reach Merle never fills up. */
 const SENDING_MAX = 4;
 const BATCH = 200;
@@ -929,14 +931,29 @@ export function flushEvents(now = Date.now(), force = false) {
               return [];
             }
           });
-        for (let k = 0; k < lines.length; k += BATCH) {
+        // 200 lines and 50 sessions a batch at most.
+        const batches = [];
+        for (const l of lines) {
+          const b = batches.at(-1);
+          if (
+            !b ||
+            b.lines.length >= BATCH ||
+            (!b.sessions.has(l.session) && b.sessions.size >= SESSIONS_A_BATCH)
+          )
+            batches.push({ lines: [l], sessions: new Set([l.session]) });
+          else {
+            b.lines.push(l);
+            b.sessions.add(l.session);
+          }
+        }
+        for (const b of batches) {
           const r = await api('/v1/runner/hook/events', {
             method: 'POST',
-            body: JSON.stringify({ events: lines.slice(k, k + BATCH) }),
+            body: JSON.stringify({ events: b.lines }),
           });
           // Too many this hour, or lines Merle refused: what's left of this batch goes, never sent again.
           if (!r.ok && r.status !== 400 && r.status !== 413 && r.status !== 429) return sent;
-          sent += Math.min(BATCH, lines.length - k);
+          sent += b.lines.length;
           heard = now;
         }
         rmSync(join(SPOOL, n), { force: true });

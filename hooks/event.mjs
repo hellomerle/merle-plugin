@@ -105,7 +105,8 @@ export function actsOf(command) {
       const stop = args.findIndex((x) => MANAGE.test(x));
       if (
         (stop < 0 ? args : args.slice(0, stop)).some((x) =>
-          /^(?:test|check|vitest|jest|playwright|e2e)$/.test(x),
+          // A script by its name or a namespaced one ("test:edge", "check:types"), never a word that only starts so.
+          /^(?:test|check|vitest|jest|playwright|e2e)(?::[\w.-]+)?$/.test(x),
         )
       )
         acts.add('test');
@@ -167,7 +168,11 @@ export function factOf(input, now = Date.now()) {
       const bare = bareOf(input.tool_input?.command) ?? '';
       const mixed =
         acts.length > 0 &&
-        (bg || /\|\||;|\||\n/.test(bare.replace(/&&/g, '')) || (!ok && bare.includes('&&')));
+        (bg ||
+          // The shell's own `&` (never `&&`, `2>&1` or `&>`): sent to the background, it has only started (Codex).
+          /(?:^|[^&>])&(?![&>])/.test(bare) ||
+          /\|\||;|\||\n/.test(bare.replace(/&&/g, '')) ||
+          (!ok && bare.includes('&&')));
       const ms = int(Math.round(Number(input.duration_ms ?? input.tool_response?.duration_ms)), 86_400_000);
       return {
         ...base,
