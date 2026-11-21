@@ -41,6 +41,56 @@ const PERSONAL = /* @__PURE__ */ new Set([
   "cuenta",
   "cuentas"
 ]);
+const LB = "";
+const starts = (before, body, flags) => ({
+  re: new RegExp(
+    body.replace(LB, () => `(?<!${before})`),
+    `g${flags}`
+  ),
+  again: new RegExp(
+    body.replace(LB, () => ""),
+    `y${flags}`
+  )
+});
+const chained = (r, t, kind, rank, out) => {
+  r.re.lastIndex = 0;
+  for (let m = r.re.exec(t); m; m = r.re.exec(t)) {
+    let e = m.index + m[0].length;
+    out.push({ s: m.index, e, kind, rank });
+    for (let k = 0; k < 4 && e + k < t.length; k++) {
+      r.again.lastIndex = e + k;
+      const n = r.again.exec(t)?.[0];
+      if (!n) continue;
+      out.push({ s: e + k, e: e + k + n.length, kind, rank });
+      e += k + n.length;
+      k = -1;
+    }
+    r.re.lastIndex = e;
+  }
+  return out;
+};
+const after = (r, t, kind, rank, out) => {
+  let end = -1;
+  for (const m of t.matchAll(r.head)) {
+    const p = (m.index ?? 0) + m[0].length;
+    if (r.name && !r.name.test(m.groups?.n ?? "")) continue;
+    if (p < end) {
+      if (!r.lead) continue;
+      r.lead.lastIndex = p;
+      if (!r.lead.test(t)) continue;
+    }
+    r.value.lastIndex = p;
+    const v = r.value.exec(t)?.[0] ?? "";
+    if (r.run) {
+      r.run.lastIndex = p;
+      r.run.exec(t);
+      end = Math.max(end, r.run.lastIndex);
+    } else end = Math.max(end, p + v.length);
+    if (v.length >= (r.min ?? 1) && (!r.need || r.need.test(v)))
+      out.push({ s: r.whole ? m.index ?? 0 : p, e: p + v.length, kind, rank });
+  }
+  return out;
+};
 const PERSON = [
   // A class that names a person the same way ("div.profile-zoe-keller", "a.user-zoe"), unless what follows is one word
   // a page names its own parts by ("a.user-menu", "div.profile-picture").
@@ -51,13 +101,36 @@ const PERSON = [
   // After a record word in prose, a quoted name or one joined by . _ or - is a name: 'Cannot find user "zoe"',
   // "User zoe.keller not found". "user settings" stays words.
   [
-    /(?<=\b(?:user|customer|member|account|profile|benutzer|kunde|utilisateur|usuario|cliente)\s+)(?:"[^"\s]{1,40}"|'[^'\s]{1,40}'|[\p{L}\p{N}]+(?:[._:@-][\p{L}\p{N}]+)+)/giu,
+    {
+      head: /\b(?:user|customer|member|account|profile|benutzer|kunde|utilisateur|usuario|cliente)\s+/giu,
+      value: /"[^"\s]{1,40}"|'[^'\s]{1,40}'|[\p{L}\p{N}]+(?:[._:@-][\p{L}\p{N}]+)+/uy
+    },
     "name"
   ]
 ];
 const quote = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const anyCase = (w) => w.replace(/[a-z]/g, (c) => `[${c.toUpperCase()}${c}]`);
-const SECRET_NAME = String.raw`[A-Za-z0-9_]*(?:${["key", "token", "secret", "password", "passwd", "passphrase", "pass", "pwd", "auth", "credentials?"].map(anyCase).join("|")})(?:_[A-Za-z0-9_]*|[A-Z][A-Za-z0-9_]*)?`;
+const SECRET_NAME = new RegExp(
+  `(?:${["key", "token", "secret", "password", "passwd", "passphrase", "pass", "pwd", "auth", "credentials?"].map(anyCase).join("|")})(?:_|[A-Z]|$)`
+);
+const NOT_A_VALUE = `
+the a an my our your their his her its this that these those it them me you us him be is was and or not no
+never also just still all any every each some one both too very only already now then there log login sign
+access reset change get use unlock open enter make keep set protect prevent avoid stop match see check do
+have go work type rejected changed wrong incorrect invalid expired accepted correct right empty blank
+missing weak strong short long leaked stolen compromised updated saved sent lost forgotten fine ok okay
+fixed removed deleted typed entered used shared given emailed stored hashed case required needed blocked
+locked
+`.trim().split(/\s+/);
+const SECRETY = String.raw`\S{0,40}[\d=+/!@#$%^&*]|\p{L}{16}`;
+const VALUE_AFTER_TO = (() => {
+  const word = String.raw`(?=\S)(?:(?!(?:${NOT_A_VALUE.join("|")})[.,;:!?)\]"'”’…—]*(?!\S))|(?=${SECRETY}))`;
+  return String.raw`(?=:\s*${word}|(?!:)${word}|${SECRETY})`;
+})();
+const PROSE_VALUE = { value: /(?::\s*)?\S{4,}/y, run: /(?::\s*)?\S*/y, lead: /:\s/y };
+const PASSWORD_FOR = [0, 1, 2, 3].map(
+  (k) => String.raw`\bpass(?:word|wort)${k ? String.raw`\s+(?:for|für)(?:\s+[\p{L}\p{N}_.'’()/-]{1,40}){${k}}` : ""}\s*`
+);
 const CREDENTIALS = [
   // Tokens: API keys, GitHub tokens, JWTs, bearer values.
   // A private key, whole: the markers and everything between them.
@@ -66,7 +139,7 @@ const CREDENTIALS = [
     "id"
   ],
   // An AWS secret key, by its name or its shape next to an access key.
-  [/(?<=AWS_SECRET_ACCESS_KEY\s*[=:]\s*["']?)[A-Za-z0-9/+=]{30,}/g, "id"],
+  [{ head: /AWS_SECRET_ACCESS_KEY\s*[=:]\s*["']?/g, value: /[A-Za-z0-9/+=]*/y, min: 30 }, "id"],
   [/\bsk-[A-Za-z0-9_-]{10,}/g, "id"],
   // Stripe, Slack, Google, GitLab and npm keys, by their shapes.
   [/\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{10,}/g, "id"],
@@ -82,51 +155,83 @@ const CREDENTIALS = [
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "id"],
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "id"],
   [/\bAKIA[0-9A-Z]{16}\b/g, "id"],
-  [/(?<=\bBasic\s+)[A-Za-z0-9+/=]{8,}/g, "id"],
-  // In prose too: "the password is …", "is now …", "set the password to …", "das Passwort ist …",
-  // "is:", "was", "for prod is", "lautet" too: the word for it, what it is for (one word), then a word that says the value.
-  [
-    // Every run in it is bounded, so it costs the same at each place whatever the input: never a slow pass. "was" and
-    // "to" take only what looks like a secret (a digit or a sign, or one word of 16 letters or more, a passphrase), so
-    // "my password was rejected" stays words.
-    new RegExp("(?<=\\bpass(?:word|wort)(?:\\s{1,3}(?:for|f\xFCr)(?:\\s{1,3}[\\p{L}\\p{N}_.'\u2019()/-]{1,40}){1,3})?\\s{0,3}(?:(?:(?:is(?: now)?|ist|lautet)\\b|:)\\s{0,3}:?|(?:was|to)\\b\\s{0,3}:?(?=\\s{0,3}(?:\\S{0,40}[\\d=+/!@#$%^&*]|\\p{L}{16})))\\s{0,3})\\S{4,}", "giu"),
+  [{ head: /\bBasic\s+/g, value: /[A-Za-z0-9+/=]*/y, min: 8 }, "id"],
+  // In prose too: "the password is …", "is now …", "das Passwort ist …", "lautet", "password:", with what it is for
+  // ("for prod is"), any spaces between; what the value is, whatever it looks like.
+  ...PASSWORD_FOR.map((head) => [
+    {
+      head: new RegExp(String.raw`${head}(?:(?:is|ist|lautet)\b|:)\s*`, "giu"),
+      // "is now hunter2", "is now: hunter2" and "is now(x)": "now" goes with the value, a word or not.
+      value: /(?:now(?:\s*:\s*|\s+))?(?::\s*)?\S{4,}/iy,
+      run: /(?:now(?:\s*:\s*|\s+))?(?::\s*)?\S*/iy,
+      lead: /now\s|now:\s|:\s/iy
+    },
     "id"
-  ],
-  // The same with any run of spaces (Codex, #69): sorting, drafting and MCP don't fold spaces first. Each run sits
-  // between fixed words, and `(?=\S{4})` comes first, so inside a run nothing is tried: still one linear pass.
-  [/(?=\S{4})(?<=\bpass(?:word|wort)(?:\s+(?:is(?:\s+now)?|ist|lautet)\b(?:\s*:)?|\s*:)\s*)\S{4,}/giu, "id"],
-  [
-    new RegExp("(?=\\S{4})(?<=\\bpass(?:word|wort)\\s+(?:was|to)\\b(?:\\s*:)?\\s*)(?=\\S{0,40}[\\d=+/!@#$%^&*]|\\p{L}{16})\\S{4,}", "giu"),
+  ]),
+  // "set the password to …", "the old password was …": the next word, unless it starts a phrase (fails closed).
+  ...PASSWORD_FOR.map((head) => [
+    { head: new RegExp(String.raw`${head}(?:was|to)\b\s*${VALUE_AFTER_TO}`, "giu"), ...PROSE_VALUE },
     "id"
-  ],
+  ]),
   // A value after a word that names a secret ("bad key c2VjcmV0…", "token: abc123…"): with a digit or base64 padding.
-  [/(?<=\b(?:key|token|secret|pass(?:word|wort)?|pwd|api[- ]?key)\b[:=\s]{1,3})(?=\S*[\d=+/])\S{8,}/gi, "id"],
+  // The head looks back a bounded way, so it costs the same at each place.
+  [
+    {
+      head: /(?<=\b(?:key|token|secret|pass(?:word|wort)?|pwd|api[- ]?key)\b[:=\s]{1,3})(?=\S)/gi,
+      value: /\S*/y,
+      min: 8,
+      need: /[\d=+/]/
+    },
+    "id"
+  ],
   // A quoted value after a setting's name, the name quoted or not, its quotes escaped any number of times or not, by
   // = : => := or $'…' ('"DB_PASSWORD": "two words"', "'password' => 'a b'", '{\"api_token\":\"…\"}', "api_key: `a b`"):
   // the whole value, spaces and escaped quotes in it too; one that never closes takes the rest of the line. The name
   // ends in a word for a secret, any case, or goes on only by `_` or a capital (clientSecretValue), so `passed` stays.
   ...['"', "'", "`"].map((q) => [
-    new RegExp(
-      String.raw`(?<=\b${SECRET_NAME}\\*["'${"`"}]?\s*(?:=>|:=|[=:])\s*\$?\\*${q})(?:[^${q}\\\n]|\\.)+`,
-      "g"
-    ),
+    {
+      head: new RegExp(String.raw`\b(?<n>[A-Za-z0-9_]+)\\*["'${"`"}]?\s*(?:=>|:=|[=:])\s*\$?\\*${q}`, "g"),
+      value: new RegExp(String.raw`(?:[^${q}\\\n]|\\.)*`, "y"),
+      name: SECRET_NAME
+    },
     "id"
   ]),
   // The same after a setting's name that ends in such a word ("STRIPE_SECRET_KEY=…", "DB_PASSWORD: …"), any value.
   [
-    /(?<=\b[A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)["']?\s*[=:]\s*["']?)(?!\[)[^\s"',;[\]]{4,}/g,
+    {
+      head: /\b(?<n>[A-Za-z0-9_]+)["']?\s*[=:]\s*["']?/g,
+      value: /[^\s"',;[\]]*/y,
+      min: 4,
+      name: /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)$/
+    },
     "id"
   ],
-  [/(?<=\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, "id"]
+  [{ head: /\bBearer\s+/gi, value: /[A-Za-z0-9._~+/=-]*/y, min: 8 }, "id"]
 ];
 const RULES = [
   // An element id or data attribute that names a person: what the button makes of the host page's own ids.
   [/#(?:user|customer|account|member|profile|client|person|contact|kunde)[-_][\w.-]+/gi, "id", "first"],
-  [/\[data-(?:user|customer|account|email|name|member)[-\w]*=["']?[^"'\]]+["']?\]/gi, "id", "first"],
+  [
+    {
+      head: /\[data-(?:user|customer|account|email|name|member)[-\w]*=["']?/gi,
+      value: /[^"'\]]+["']?\]/y,
+      run: /[^"'\]]*/y,
+      whole: true
+    },
+    "id",
+    "first"
+  ],
   // An address written for people: "anna at host dot com", "[at]", "(at)".
   [
     // Only an address: the last label is a domain ending, so "look at the dot on the screen" stays a sentence.
-    /[\p{L}\p{M}\p{N}._%+-]+\s*(?:\[at\]|\(at\)|\{at\}|\s+at\s+)\s*[\p{L}\p{M}\p{N}-]+(?:\s*(?:\.|\[dot\]|\(dot\)|\s+dot\s+)\s*[\p{L}\p{M}\p{N}-]+)*\s*(?:\.|\[dot\]|\(dot\)|\s+dot\s+)\s*(?:com|net|org|io|co|de|fr|es|it|nl|uk|ch|at|eu|app|dev|test|me|ai|info|biz)\b/giu,
+    // It starts only where a run of its letters starts, and each "at" and "dot" has one way through its spaces, so a
+    // long word or run of spaces is read once.
+    // Right where one ends, it may start again ("anna at x dot com.bob at corp dot com").
+    starts(
+      String.raw`[\p{L}\p{M}\p{N}._%+-]`,
+      String.raw`${LB}[\p{L}\p{M}\p{N}._%+-]+(?:\s*(?:\[at\]|\(at\)|\{at\})\s*|\s+at\s+)[\p{L}\p{M}\p{N}-]+(?:(?:\s*(?:\.|\[dot\]|\(dot\))\s*|\s+dot\s+)[\p{L}\p{M}\p{N}-]+)*(?:\s*(?:\.|\[dot\]|\(dot\))\s*|\s+dot\s+)(?:com|net|org|io|co|de|fr|es|it|nl|uk|ch|at|eu|app|dev|test|me|ai|info|biz)\b`,
+      "iu"
+    ),
     "email",
     "first"
   ],
@@ -136,7 +241,14 @@ const RULES = [
   // Spaces around the @ and before the dots are still an address ("anna . schmidt @ acme . test"); a space only
   // after a dot is prose ("write to jane@acme. Then…").
   [
-    /(?:"[^"\n@]{1,64}"|[\p{L}\p{M}\p{N}_%+-]+(?:(?:\.|\s\.\s?)[\p{L}\p{M}\p{N}_%+-]+)*)\s?@\s?[\p{L}\p{M}\p{N}_-]+(?:(?:\.|\s\.\s?)[\p{L}\p{M}\p{N}_-]+)+/gu,
+    // An unquoted local part starts only where it can't go on from what is before it (a letter, "x." or "x . "): any
+    // later start would end where it does, so a long word is read once, never once per letter. Right where one ends,
+    // it may start again ("anna@x.io%2Cbob@corp.com").
+    starts(
+      String.raw`[\p{L}\p{M}\p{N}_%+-](?:\.|\s\.\s?)?`,
+      String.raw`(?:"[^"\n@]{1,64}"|${LB}[\p{L}\p{M}\p{N}_%+-]+(?:(?:\.|\s\.\s?)[\p{L}\p{M}\p{N}_%+-]+)*)\s?@\s?[\p{L}\p{M}\p{N}_-]+(?:(?:\.|\s\.\s?)[\p{L}\p{M}\p{N}_-]+)+`,
+      "u"
+    ),
     "email",
     "first"
   ],
@@ -151,8 +263,16 @@ const RULES = [
   [/\b(?:\d{4}[ ,.-]\s?){3}\d{4}\b/g, "number"],
   // A phone: a + or 00 and at least 7 more digits with the usual separators, or a national 0-prefixed number.
   [/(?:\+|\b00)\d[\d\s()._/·‑-]{6,}\d/g, "phone"],
-  [/\b0(?!\d\.\d{2}\.\d{4}\b)\d[\d\s()._/·‑-]{7,}\d\b/g, "phone"],
-  // not a date like 03.11.2026
+  // Not a date like 03.11.2026. Each run of its signs is read once: a later start in it would end where this one does.
+  [
+    {
+      head: /\b0(?!\d\.\d{2}\.\d{4}\b)\d/g,
+      value: /[\d\s()._/·‑-]{7,}\d\b/y,
+      run: /[\d\s()._/·‑-]*/y,
+      whole: true
+    },
+    "phone"
+  ],
   // An area code in brackets, then the local number: (11) 91234-5678, (21) 2345 6789.
   [/\(\d{2,3}\)\s?\d{4,5}[ .-]?\d{4}\b/g, "phone"],
   // National formats with no + or leading 0: 415-555-0199, (415) 555-0199, (415)555-0199, 415 555 0199, 415.555.0199.
@@ -209,6 +329,8 @@ function scrubber(known = []) {
     names.map((n) => n.includes("@") ? n.slice(0, n.lastIndexOf("@")) : n).flatMap((n) => n.toLowerCase().split(/[\s._+'’-]+/)).filter((p) => p.length >= 3)
   );
   const all = (re, t, kind, rank, out) => {
+    if ("again" in re) return chained(re, t, kind, rank, out);
+    if (!(re instanceof RegExp)) return after(re, t, kind, rank, out);
     for (const m of t.matchAll(new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`)))
       if (m[0]) out.push({ s: m.index ?? 0, e: (m.index ?? 0) + m[0].length, kind, rank });
     return out;
@@ -237,7 +359,33 @@ function scrubber(known = []) {
     return out;
   };
   const PATHLIKE = /(?<![\p{L}\p{N}:/[])\/[\p{L}\p{N}_~@.%-]+(?:\/[\p{L}\p{N}_~@.%;=,-]*)+/gu;
-  const URL_IN_TEXT = /\bhttps?:\/\/(?:\[[^\s\]]*\]|[^\s"'<>)\]])+/gi;
+  const URL_HEAD = /\bhttps?:\/\//gi;
+  const urls = (t) => {
+    const out = [];
+    let open = -1;
+    URL_HEAD.lastIndex = 0;
+    for (let m = URL_HEAD.exec(t); m; m = URL_HEAD.exec(t)) {
+      const from = m.index + m[0].length;
+      let i = from;
+      while (i < t.length) {
+        const c = t[i] ?? "";
+        if (c === "[" && i >= open) {
+          let j = i + 1;
+          while (j < t.length && t[j] !== "]" && !/\s/.test(t[j] ?? "")) j++;
+          if (t[j] === "]") {
+            i = j + 1;
+            continue;
+          }
+          open = j;
+        }
+        if (/[\s"'<>)\]]/.test(c)) break;
+        i++;
+      }
+      if (i > from) out.push({ at: m.index, url: t.slice(m.index, i) });
+      URL_HEAD.lastIndex = Math.max(i, URL_HEAD.lastIndex);
+    }
+    return out;
+  };
   const HOMES = [/(?<=\b[a-z]:[\\/]users[\\/])[^\\/"'\n]+/gi, /(?<=[\\/](?:home|users)[\\/])[^/\\\s"')]+/gi];
   const JOINED = /(?<![\p{L}\p{N}])(@?)([\p{L}\p{N}]+(?:[-_.+@:][\p{L}\p{N}]+)+)/gu;
   const joined = (t, out) => {
@@ -301,9 +449,9 @@ function scrubber(known = []) {
   const text = (s) => {
     const t = normalise(s);
     const spans = values(t);
-    for (const m of t.matchAll(URL_IN_TEXT)) {
-      const u = /^(https?:\/\/[^/?#]+)([/?#].*)?$/i.exec(m[0]);
-      if (u?.[2]) segments(u[2], (m.index ?? 0) + (u[1]?.length ?? 0), false, spans);
+    for (const { at, url } of urls(t)) {
+      const u = /^(https?:\/\/[^/?#]+)([/?#].*)?$/i.exec(url);
+      if (u?.[2]) segments(u[2], at + (u[1]?.length ?? 0), false, spans);
     }
     for (const m of t.matchAll(PATHLIKE)) segments(m[0], m.index ?? 0, true, spans);
     for (const re of HOMES) all(re, t, "name", LAST, spans);
