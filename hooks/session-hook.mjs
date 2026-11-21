@@ -462,6 +462,8 @@ const postCheckin = (pin, input, event, client) =>
       ...(client === undefined ? { gate: true, paused: pausedRev(input.session_id) } : {}),
       // And its own teammates' hooks take a note to one of them (agent-note): only Claude Code's plugin has them.
       ...(client === undefined ? { notes: 2 } : {}),
+      // And its gate (pause-gate.mjs, this same plugin) reads one teammate's own pause file.
+      ...(client === undefined ? { pauses: 2 } : {}),
     }),
   });
 

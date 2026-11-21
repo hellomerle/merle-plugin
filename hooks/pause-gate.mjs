@@ -17,6 +17,7 @@
  *
  * Its paths are the runner's (merle-runner.mjs HOME and LOG); tests/install/pause.test.ts holds them equal.
  */
+import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -32,10 +33,10 @@ const SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
  * Whether this session is paused here: its pause file is there. Only looked at, never opened, so nothing put in its
  * place can hold a tool call up. One that is there but can't be looked at counts as paused too.
  */
-export function pausedHere(session) {
+export function pausedHere(session, agent) {
   if (typeof session !== 'string' || !SESSION_ID.test(session)) return false;
   try {
-    statSync(join(HOME, 'sessions', `${session}.paused`));
+    statSync(join(HOME, 'sessions', agent ? `${session}.${agent}.paused` : `${session}.paused`));
     return true;
   } catch (err) {
     // Not there, or no sessions folder for it to be in: not paused. Anything else in the way: paused.
@@ -47,9 +48,11 @@ export function pausedHere(session) {
  * Whether this is the pause's first refusal: true once, when its marker is made (O_EXCL, so only one call can). The
  * runner takes the marker away with each new pause and each resume. One it can't make counts as a later refusal.
  */
-const firstRefusal = (session) => {
+const firstRefusal = (session, agent) => {
   try {
-    closeSync(openSync(join(HOME, 'sessions', `${session}.held`), 'wx', 0o600));
+    closeSync(
+      openSync(join(HOME, 'sessions', agent ? `${session}.${agent}.held` : `${session}.held`), 'wx', 0o600),
+    );
     return true;
   } catch {
     return false;
@@ -84,8 +87,19 @@ function main() {
     if (v && typeof v === 'object') input = v;
   } catch {}
   const session = input.session_id;
-  if (!pausedHere(session)) return;
-  const first = firstRefusal(session);
+  // Inside a teammate or a subagent (Claude Code's `agent_id`): its own pause file too, by its row key (event.mjs subOf),
+  // so one teammate is held while the session's thread and the others go on. The session's pause holds
+  // them all.
+  const agent =
+    typeof input.agent_id === 'string' && input.agent_id
+      ? `sub-${createHash('sha256')
+          .update(`${session}:${input.agent_id.slice(0, 200)}`)
+          .digest('hex')
+          .slice(0, 8)}`
+      : null;
+  const held = pausedHere(session) ? null : agent && pausedHere(session, agent) ? agent : undefined;
+  if (held === undefined) return;
+  const first = firstRefusal(session, held);
   try {
     mkdirSync(dirname(LOG), { recursive: true });
     const tool = String(input.tool_name ?? '')
@@ -93,11 +107,13 @@ function main() {
       .slice(0, 64);
     appendFileSync(
       LOG,
-      `${JSON.stringify({ at: new Date().toISOString(), event: 'paused tool', session, tool, first })}\n`,
+      `${JSON.stringify({ at: new Date().toISOString(), event: 'paused tool', session, ...(held ? { agent: held } : {}), tool, first })}\n`,
       { mode: 0o600 },
     );
   } catch {} // the pause holds even when its line can't be written: refusing is the safe way
-  process.stdout.write(`${JSON.stringify(first ? FIRST : PAUSED)}\n`);
+  // Inside a teammate, a deny alone: `continue: false` there was never tried on Claude Code and could end the session's
+  // own turn, which goes on while one teammate is held.
+  process.stdout.write(`${JSON.stringify(first || held ? FIRST : PAUSED)}\n`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();

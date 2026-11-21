@@ -1037,7 +1037,10 @@ const REV_MAX = 1_000_000_000;
  * plugin's PreToolUse hook (hooks/pause-gate.mjs) refuses every tool and ends the turn. Written only here, whole and
  * renamed into place, so a hook writing the session's other record at the same moment can't take it away.
  */
-export const pauseFile = (session) => join(SESSIONS, `${session}.paused`);
+export const pauseFile = (session, agent) =>
+  join(SESSIONS, agent ? `${session}.${agent}.paused` : `${session}.paused`);
+/** A teammate's row key (event.mjs subOf): one teammate's own pause file is named by it. */
+const AGENT_KEY = /^sub-[0-9a-f]{8}$/;
 /**
  * Every pause on this Mac goes, with the gate's markers and the prompts' (session-hook.mjs): unpaired or removed in
  * Merle, nobody could resume one.
@@ -1073,6 +1076,7 @@ export function pauseRefusal(p) {
   if (!p || typeof p !== 'object') return 'shape';
   if (typeof p.session !== 'string' || !SESSION_ID.test(p.session)) return 'shape';
   if (typeof p.paused !== 'boolean' || !Number.isSafeInteger(p.rev) || p.rev < 1) return 'shape';
+  if (p.agent !== undefined && !(typeof p.agent === 'string' && AGENT_KEY.test(p.agent))) return 'shape';
   if (!p.paused) return null;
   const rec = sessionRecord(p.session);
   if (rec.session !== p.session) return 'not hooked up here';
@@ -1081,11 +1085,11 @@ export function pauseRefusal(p) {
 }
 /** Applies one pause or resume: the file written whole, or taken away; false when a newer one is on file. Throws if it can't. */
 export function applyPause(p, now = Date.now()) {
-  const f = pauseFile(p.session);
+  const f = pauseFile(p.session, p.agent);
   // A newer change already on file (another runner process got there first) is never undone by an older one.
-  if ((pausedRev(p.session) ?? 0) > p.rev) return false;
+  if ((pausedRev(p.session, p.agent) ?? 0) > p.rev) return false;
   // The gate's first-refusal marker goes with every change: a new pause asks Claude to end its turn once more.
-  rmSync(join(SESSIONS, `${p.session}.held`), { force: true });
+  rmSync(join(SESSIONS, p.agent ? `${p.session}.${p.agent}.held` : `${p.session}.held`), { force: true });
   if (!p.paused) {
     rmSync(f, { force: true });
     return true;
@@ -1105,10 +1109,10 @@ export function applyPause(p, now = Date.now()) {
  * The rev written in a session's pause file: null when there is none, 0 when it is there but can't be read (the gate
  * counts that as paused too). What a session's check-in tells Merle (session-hook.mjs).
  */
-export function pausedRev(session) {
+export function pausedRev(session, agent) {
   let raw;
   try {
-    raw = readFileSync(pauseFile(session), 'utf8');
+    raw = readFileSync(pauseFile(session, agent), 'utf8');
   } catch (err) {
     return err?.code === 'ENOENT' || err?.code === 'ENOTDIR' ? null : 0;
   }
@@ -1130,10 +1134,18 @@ async function pauses(list) {
   const done = [];
   for (const p of list.slice(0, 50)) {
     let why = pauseRefusal(p);
-    if (why === 'shape' && !(typeof p?.session === 'string' && SESSION_ID.test(p.session))) continue;
+    // Never answered: a session id that isn't one, or a teammate key that isn't one (an answer without it would read
+    // as the session's own).
+    if (
+      why === 'shape' &&
+      (!(typeof p?.session === 'string' && SESSION_ID.test(p.session)) ||
+        (p.agent !== undefined && !(typeof p.agent === 'string' && AGENT_KEY.test(p.agent))))
+    )
+      continue;
     if (!why)
       try {
-        if (!p.paused) log({ event: 'resuming', session: p.session, rev: p.rev });
+        if (!p.paused)
+          log({ event: 'resuming', session: p.session, ...(p.agent ? { agent: p.agent } : {}), rev: p.rev });
         if (!applyPause(p)) why = 'older than the one on this Mac';
       } catch {
         why = p.paused ? 'couldn’t write its pause file' : 'couldn’t log or take its pause away';
@@ -1142,6 +1154,7 @@ async function pauses(list) {
       log({
         event: why ? 'pause refused' : p.paused ? 'paused' : 'resumed',
         session: p.session,
+        ...(p.agent ? { agent: p.agent } : {}),
         rev: p.rev,
         ...(why ? { reason: why } : {}),
       });
@@ -1154,6 +1167,7 @@ async function pauses(list) {
       method: 'POST',
       body: JSON.stringify({
         session: p.session,
+        ...(p.agent ? { agent: p.agent } : {}),
         rev: Number.isSafeInteger(p.rev) && p.rev >= 1 ? p.rev : 1,
         state: why ? 'refused' : p.paused ? 'paused' : 'resumed',
         ...(why ? { reason: why } : {}),
@@ -1443,7 +1457,7 @@ export async function once(now = Date.now(), wait = 25) {
   const products = [...new Set(c.repos.map((r) => r.product))].join(',');
   const got = await (
     await api(
-      `/v1/runner/jobs?wait=${wait}&limit=${room}&v=4&products=${encodeURIComponent(products)}${SELF ? `&runner=${SELF}` : ''}`,
+      `/v1/runner/jobs?wait=${wait}&limit=${room}&v=5&products=${encodeURIComponent(products)}${SELF ? `&runner=${SELF}` : ''}`,
       {
         // Its wait and a full minute more: Merle marks a stop or a job delivered before it answers, so a look given up
         // too soon could lose one. A reply lost on the way (the connection or the Worker gone) still can, as before.
