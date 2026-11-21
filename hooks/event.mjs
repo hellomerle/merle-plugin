@@ -49,6 +49,14 @@ export const TOOLS = [
   'apply_patch',
 ];
 export const AGENT_TYPES = ['general-purpose', 'Explore', 'Plan', 'statusline-setup', 'claude-code-guide'];
+/** The other closed words a fact may carry: the runner and Merle check against the same (tests hold them equal). */
+export const WORDS = {
+  source: ['startup', 'resume', 'clear', 'compact', 'fork'],
+  model: ['opus', 'sonnet', 'haiku', 'fable', 'other'],
+  kind: ['permission', 'idle', 'input'],
+  trigger: ['auto', 'manual'],
+  reason: ['clear', 'resume', 'logout', 'prompt_input_exit', 'other'],
+};
 const familyOf = (model) =>
   typeof model === 'string' && model
     ? (/(opus|sonnet|haiku|fable)/i.exec(model)?.[1]?.toLowerCase() ?? 'other')
@@ -130,9 +138,7 @@ export function factOf(input, now = Date.now()) {
       return {
         ...base,
         e: 'start',
-        ...(['startup', 'resume', 'clear', 'compact', 'fork'].includes(input.source)
-          ? { source: input.source }
-          : {}),
+        ...(WORDS.source.includes(input.source) ? { source: input.source } : {}),
         ...(familyOf(input.model) ? { model: familyOf(input.model) } : {}),
       };
     case 'UserPromptSubmit':
@@ -149,6 +155,7 @@ export function factOf(input, now = Date.now()) {
       const code = ok
         ? 0
         : Number(/^Exit code (\d{1,3})\b/.exec(String(input.error ?? ''))?.[1] ?? Number.NaN);
+      // A shell's exit code is 0 to 255; anything else is no code at all, as Merle takes it.
       const acts = tool === 'Bash' ? actsOf(input.tool_input?.command) : [];
       // Sent to the background, it has only started: no exit code and no outcome yet (Codex).
       const bg =
@@ -169,7 +176,7 @@ export function factOf(input, now = Date.now()) {
         tool,
         ok,
         ...(input.is_interrupt === true ? { stopped: true } : {}),
-        ...(tool === 'Bash' && !bg && Number.isSafeInteger(code) ? { exit: code } : {}),
+        ...(tool === 'Bash' && !bg && Number.isSafeInteger(code) && code <= 255 ? { exit: code } : {}),
         ...(acts.length ? { acts } : {}),
         ...(mixed ? { mixed: true } : {}),
         ...(ms !== undefined ? { ms } : {}),
@@ -194,15 +201,13 @@ export function factOf(input, now = Date.now()) {
       return {
         ...base,
         e: 'compact',
-        ...(input.trigger === 'auto' || input.trigger === 'manual' ? { trigger: input.trigger } : {}),
+        ...(WORDS.trigger.includes(input.trigger) ? { trigger: input.trigger } : {}),
       };
     case 'SessionEnd':
       return {
         ...base,
         e: 'end',
-        ...(['clear', 'resume', 'logout', 'prompt_input_exit', 'other'].includes(input.reason)
-          ? { reason: input.reason }
-          : {}),
+        ...(WORDS.reason.includes(input.reason) ? { reason: input.reason } : {}),
       };
     default:
       return null;

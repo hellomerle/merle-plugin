@@ -212,7 +212,11 @@ const local = (short) => {
 };
 const saveLocal = (short, v) => {
   mkdirSync(SESSIONS, { recursive: true });
-  writeFileSync(sessionFile(short), JSON.stringify({ ...local(short), ...v }), { mode: 0o600 });
+  // Written whole and moved into place: the runner reading it meanwhile never sees it half written.
+  const to = sessionFile(short);
+  const tmp = `${to}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ ...local(short), ...v }), { mode: 0o600 });
+  renameSync(tmp, to);
 };
 /** Unhooked here (/merle unhook): it takes nothing, whatever Merle says, until it's hooked up here again. */
 export const unhookedHere = (input) => local(shortOf(input.session_id)).unhooked === true;

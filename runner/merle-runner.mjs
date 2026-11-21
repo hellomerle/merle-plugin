@@ -748,50 +748,118 @@ const SPOOL_FILE = join(SPOOL, 'events.jsonl');
 const SPOOL_NOW = join(SPOOL, 'now');
 /** The most a spool file holds (hooks/event.mjs SPOOL_MAX, and a line's room). */
 const SPOOL_FILE_MAX = 1024 * 1024 + 4096;
-const FACT_KEYS = new Set(
-  [
-    'v',
-    'id',
-    'client',
-    'session',
-    'at',
-    'e',
-    'agent',
-    'source',
-    'model',
-    'len',
-    'tool',
-    'ok',
-    'stopped',
-    'exit',
-  ].concat(['acts', 'mixed', 'ms', 'kind', 'trigger', 'reason']),
-);
 /**
- * Whether a spool line is a fact as the hooks write it: only their keys, each a number, a short plain word, a boolean,
- * a short list of words or the subagent's two; never a sentence. Merle checks each against its own lists again.
+ * Each closed word a fact may carry, as the hooks write them (hooks/event.mjs) and Merle checks them again: a word not
+ * on its key's list never leaves the Mac (Codex).
  */
-export const isFact = (v) =>
-  !!v &&
-  typeof v === 'object' &&
-  !Array.isArray(v) &&
-  v.v === 1 &&
-  Object.entries(v).every(([k, x]) => {
-    if (!FACT_KEYS.has(k)) return false;
+export const FACT_WORDS = {
+  client: ['claude-code', 'codex', 'cursor'],
+  e: ['start', 'prompt', 'tool', 'wait', 'stop', 'sub_start', 'sub_stop', 'compact', 'end'],
+  tool: [
+    'Bash',
+    'Read',
+    'Edit',
+    'MultiEdit',
+    'Write',
+    'Glob',
+    'Grep',
+    'WebFetch',
+    'WebSearch',
+    'Task',
+    'Agent',
+    'TodoWrite',
+    'NotebookEdit',
+    'ExitPlanMode',
+    'AskUserQuestion',
+    'Skill',
+    'shell',
+    'apply_patch',
+    'mcp',
+    'other',
+  ],
+  agent_type: ['general-purpose', 'Explore', 'Plan', 'statusline-setup', 'claude-code-guide', 'custom'],
+  source: ['startup', 'resume', 'clear', 'compact', 'fork'],
+  model: ['opus', 'sonnet', 'haiku', 'fable', 'other'],
+  kind: ['permission', 'idle', 'input'],
+  trigger: ['auto', 'manual'],
+  reason: ['clear', 'resume', 'logout', 'prompt_input_exit', 'other'],
+};
+/** Which keys each kind of line may carry beside the common ones, as Merle's schema has them (session-events.ts). */
+const FACT_COMMON = ['v', 'id', 'client', 'session', 'at', 'e', 'agent'];
+const FACT_BY_KIND = {
+  start: ['source', 'model'],
+  prompt: ['len'],
+  tool: ['tool', 'ok', 'stopped', 'exit', 'acts', 'mixed', 'ms'],
+  wait: ['kind'],
+  stop: [],
+  sub_start: [],
+  sub_stop: [],
+  compact: ['trigger'],
+  end: ['reason'],
+};
+/** The keys each kind of line must carry, as Merle's schema has them. */
+const FACT_NEEDS = { prompt: ['len'], tool: ['tool', 'ok'], wait: ['kind'] };
+/** Each number's own range, as Merle's schema has it: a whole number in it, never a float that could carry bytes. */
+const FACT_RANGES = { len: [0, 1e7], exit: [0, 255], ms: [0, 86_400_000] };
+/** How far back and ahead a line's time may be, as Merle keeps them. */
+const FACT_PAST_MS = 3 * 86_400_000;
+const FACT_AHEAD_MS = 300_000;
+/**
+ * Whether a spool line is a fact as the hooks write it, checked as Merle checks it, so nothing leaves the Mac that
+ * Merle would refuse: only the keys its kind carries, each of its own shape (a whole number in its range, a time near
+ * now, true where only true is said, a word from its key's list, the line's and session's ids, the subagent's two).
+ */
+export const isFact = (v, now = Date.now()) => {
+  if (!v || typeof v !== 'object' || Array.isArray(v) || v.v !== 1) return false;
+  if (typeof v.e !== 'string' || !Object.hasOwn(FACT_BY_KIND, v.e)) return false;
+  const allowed = FACT_BY_KIND[v.e];
+  const needs = ['id', 'client', 'session', 'at', ...(Object.hasOwn(FACT_NEEDS, v.e) ? FACT_NEEDS[v.e] : [])];
+  if (!needs.every((k) => k in v)) return false;
+  return Object.entries(v).every(([k, x]) => {
+    if (!FACT_COMMON.includes(k) && !allowed.includes(k)) return false;
+    if (k === 'v') return x === 1;
+    if (k === 'at') return Number.isSafeInteger(x) && x > now - FACT_PAST_MS && x <= now + FACT_AHEAD_MS;
+    if (k in FACT_RANGES) return Number.isSafeInteger(x) && x >= FACT_RANGES[k][0] && x <= FACT_RANGES[k][1];
+    if (k === 'ok') return typeof x === 'boolean';
+    if (k === 'stopped' || k === 'mixed') return x === true;
     if (k === 'agent')
       return (
         !!x &&
         typeof x === 'object' &&
+        !Array.isArray(x) &&
         Object.keys(x).length === 2 &&
+        typeof x.id === 'string' &&
         /^sub-[0-9a-f]{8}$/.test(x.id) &&
-        /^[\w-]{1,20}$/.test(x.type)
+        FACT_WORDS.agent_type.includes(x.type)
       );
-    if (k === 'acts') return Array.isArray(x) && x.length <= 4 && x.every((a) => /^[a-z]{2,6}$/.test(a));
-    return (
-      typeof x === 'boolean' ||
-      (typeof x === 'number' && Number.isFinite(x)) ||
-      (typeof x === 'string' && /^[\w.:-]{1,64}$/.test(x))
-    );
+    if (k === 'acts')
+      return (
+        Array.isArray(x) && x.length <= 4 && x.every((a) => ['commit', 'push', 'pr', 'test'].includes(a))
+      );
+    if (k === 'id') return typeof x === 'string' && /^[0-9a-f]{12}$/.test(x);
+    if (k === 'session') return typeof x === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(x);
+    return typeof x === 'string' && (FACT_WORDS[k] ?? []).includes(x);
   });
+};
+/**
+ * A session this Mac hooked up and still has (its hook left the record, never unhooked here): a line naming any other
+ * never leaves, so a session id can't carry words either.
+ */
+const hookedHere = (session, seen = new Map()) => {
+  if (seen.has(session)) return seen.get(session);
+  const ok = readHooked(session);
+  seen.set(session, ok);
+  return ok;
+};
+const readHooked = (session) => {
+  try {
+    const short = session.replaceAll('-', '').slice(0, 8).toLowerCase();
+    const r = JSON.parse(readFileSync(join(HOME, 'sessions', `${short}.json`), 'utf8'));
+    return !!r && typeof r === 'object' && r.session === session && r.unhooked !== true;
+  } catch {
+    return false;
+  }
+};
 /** Batches waiting to go: past this many, the oldest goes unsent, so a Mac that can't reach Merle never fills up. */
 const SENDING_MAX = 4;
 const BATCH = 200;
@@ -849,12 +917,14 @@ export function flushEvents(now = Date.now(), force = false) {
           rmSync(at, { force: true });
           continue;
         }
+        // Each session looked up once a file (its record on the Mac).
+        const seen = new Map();
         const lines = readFileSync(at, 'utf8')
           .split('\n')
           .flatMap((l) => {
             try {
               const v = JSON.parse(l);
-              return isFact(v) ? [v] : [];
+              return isFact(v, now) && hookedHere(v.session, seen) ? [v] : [];
             } catch {
               return [];
             }
