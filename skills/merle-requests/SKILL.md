@@ -112,6 +112,17 @@ and plain:
 A thin suggestion is refused with what to add. Don't suggest what a report asked for, and never a secret, a command or
 an address. You can't read a suggestion back. If this session is hooked up to Merle, pass its `session` too.
 
+## Working a task on the Roadmap
+
+A suggestion a person added is a task with its own reference (`R-140`), as a request has. Post with `request: "R-140"`
+while you work on it, and name it in your pull request's title:
+
+- **The pull request that finishes it:** `R-140: …` (or a line `Closes R-140` in its description). Once it's merged and
+  a production deploy holds it, Merle closes the task, when it was opened from a team member's GitHub account; otherwise
+  a person sees **Looks done** and confirms. It tells no customer. Your own `report_deploy` finishes no task.
+- **Every pull request before the last, when the work takes several:** `Part of R-140: …`. Each shows on the task's row
+  once it's live, and none closes it, whatever its description says.
+
 A person may ask about your suggestion. The question reaches you after your next `post_update` or `propose_task` answer,
 or as a note to this session. Answer it once with `answer_question`, naming its id (`q-…`): a few plain lines, and when
 they ask to see it, a screenshot (`type` and `bytes`, then PUT the file to the address it gives you, as with
