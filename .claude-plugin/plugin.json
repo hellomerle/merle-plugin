@@ -1,6 +1,6 @@
 {
   "name": "merle",
-  "version": "0.1.152",
+  "version": "0.1.153",
   "description": "Add Merle's feedback button to your app on a branch, and connect your coding agent to what customers report.",
   "author": {
     "name": "Merle"

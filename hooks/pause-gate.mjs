@@ -90,7 +90,9 @@ const helperPolite = (session, agent) => {
       rmSync(marker, { force: true });
       closeSync(openSync(marker, 'wx', 0o600));
       return true;
-    } catch {
+    } catch (err) {
+      // Another of its calls made this one first (two tools at once): this one takes the next, never a harder refusal.
+      if (err?.code === 'EEXIST') continue;
       return false; // one it can't make counts as spent: refusing harder is the safe way
     }
   }
