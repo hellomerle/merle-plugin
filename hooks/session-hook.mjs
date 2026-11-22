@@ -917,7 +917,11 @@ async function main([cmd, arg]) {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))
   main(process.argv.slice(2))
     .then(async (code) => {
-      await Promise.all(afterOutput);
+      // Refusals get two seconds at most: Claude Code keeps a hook's output only if it ends inside its timeout, and the
+      // note already printed is marked delivered (the review team). One that doesn't make it in time stays marked
+      // delivered in Merle; the Mac's notes log keeps the refusal.
+      const enough = new Promise((done) => setTimeout(done, 2000).unref()); // honesty: a hook's exit wait; moves no stage
+      await Promise.race([Promise.all(afterOutput), enough]);
       return code;
     })
     .then(
