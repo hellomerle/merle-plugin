@@ -18,7 +18,16 @@
  * Its paths are the runner's (merle-runner.mjs HOME and LOG); tests/install/pause.test.ts holds them equal.
  */
 import { createHash } from 'node:crypto';
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, statSync } from 'node:fs';
+import {
+  appendFileSync,
+  closeSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -57,6 +66,35 @@ const firstRefusal = (session, agent) => {
   } catch {
     return false;
   }
+};
+
+/** Polite refusals a helper gets under the session's own pause, before its turn is ended for it. */
+const HELPER_POLITE = 3;
+/**
+ * Under the session's own pause, a helper's refusal is polite (deny alone) its first few times, then ends its turn: a
+ * helper that ignores "end your turn" can't keep the session making model calls (the security lens). Each counted
+ * marker counts only for this pause: one older than the session's pause file is from a pause before, and is made again
+ * (taken away, then made new, never following a link put in its place).
+ */
+const helperPolite = (session, agent) => {
+  let since = 0;
+  try {
+    since = statSync(join(HOME, 'sessions', `${session}.paused`)).mtimeMs;
+  } catch {}
+  for (let k = 1; k <= HELPER_POLITE; k++) {
+    const marker = join(HOME, 'sessions', `${session}.${agent}.${k}.held`);
+    try {
+      if (lstatSync(marker).mtimeMs >= since) continue;
+    } catch {}
+    try {
+      rmSync(marker, { force: true });
+      closeSync(openSync(marker, 'wx', 0o600));
+      return true;
+    } catch {
+      return false; // one it can't make counts as spent: refusing harder is the safe way
+    }
+  }
+  return false;
 };
 
 const WHY =
@@ -99,7 +137,10 @@ function main() {
       : null;
   const held = pausedHere(session) ? null : agent && pausedHere(session, agent) ? agent : undefined;
   if (held === undefined) return;
-  const first = firstRefusal(session, held);
+  // Each its own first refusal: the thread's marker is the session's, a teammate's its own, so a teammate held by the
+  // session's pause never spends the thread's polite one (steer coverage 2.5). Under the session's pause a helper's are
+  // counted for that pause (helperPolite).
+  const first = !agent ? firstRefusal(session, null) : held === agent ? firstRefusal(session, agent) : false;
   try {
     mkdirSync(dirname(LOG), { recursive: true });
     const tool = String(input.tool_name ?? '')
@@ -111,9 +152,11 @@ function main() {
       { mode: 0o600 },
     );
   } catch {} // the pause holds even when its line can't be written: refusing is the safe way
-  // Inside a teammate, a deny alone: `continue: false` there was never tried on Claude Code and could end the session's
-  // own turn, which goes on while one teammate is held.
-  process.stdout.write(`${JSON.stringify(first || held ? FIRST : PAUSED)}\n`);
+  // Inside a teammate held by its own pause, a deny alone: `continue: false` there was never tried on Claude Code and
+  // could end the session's own turn, which goes on while one teammate is held.
+  // Under its own pause, a helper's refusal is always a deny alone; under the session's, a deny alone a few times first.
+  const polite = first || (agent ? held === agent || helperPolite(session, agent) : false);
+  process.stdout.write(`${JSON.stringify(polite ? FIRST : PAUSED)}\n`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();

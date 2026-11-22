@@ -1088,6 +1088,9 @@ export function applyPause(p, now = Date.now()) {
   const f = pauseFile(p.session, p.agent);
   // A newer change already on file (another runner process got there first) is never undone by an older one.
   if ((pausedRev(p.session, p.agent) ?? 0) > p.rev) return false;
+  // The same pause again (its answer lost on the way, handed out once more): already in place, so nothing is touched,
+  // and the gate's count of polite refusals goes on where it was (the security lens).
+  if (p.paused && pausedRev(p.session, p.agent) === p.rev) return true;
   // The gate's first-refusal marker goes with every change: a new pause asks Claude to end its turn once more.
   rmSync(join(SESSIONS, p.agent ? `${p.session}.${p.agent}.held` : `${p.session}.held`), { force: true });
   if (!p.paused) {
