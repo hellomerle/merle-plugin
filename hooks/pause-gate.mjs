@@ -142,6 +142,8 @@ function main() {
   // counted for that pause (helperPolite).
   const first = !agent ? firstRefusal(session, null) : held === agent ? firstRefusal(session, agent) : false;
   try {
+    // A folder of a test's own never writes this Mac's own log (the P0 of 22 Nov): its line needs a log of its own.
+    if (process.env.MERLE_RUNNER_HOME !== undefined && process.env.MERLE_RUNNER_LOG === undefined) throw 0;
     mkdirSync(dirname(LOG), { recursive: true });
     const tool = String(input.tool_name ?? '')
       .replace(/[^\w.:-]/g, '')

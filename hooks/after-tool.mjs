@@ -15,6 +15,14 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HOME = process.env.MERLE_RUNNER_HOME ?? join(homedir(), 'Library', 'Application Support', 'Merle');
+/**
+ * This Mac's own folder only with hellomerle.com: a hook run for any other Merle (a test) with no folder of its own
+ * writes nothing (the P0 of 22 Nov; merle-runner.mjs homeRefusal).
+ */
+const OFF =
+  process.env.MERLE_RUNNER_HOME === undefined &&
+  process.env.MERLE_URL !== undefined &&
+  process.env.MERLE_URL !== 'https://app.hellomerle.com';
 const SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
 
 async function main() {
@@ -46,7 +54,7 @@ async function main() {
 }
 
 // A hook that fails says nothing: the session goes on, and its next check-in clears what Merle shows.
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))
+if (!OFF && process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))
   main().then(
     () => process.exit(0),
     () => process.exit(0),

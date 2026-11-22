@@ -22,6 +22,14 @@ import { settings } from '../runner/reading.mjs';
 import { scrubber } from '../runner/scrub.mjs';
 
 const HOME = process.env.MERLE_RUNNER_HOME ?? join(homedir(), 'Library', 'Application Support', 'Merle');
+/**
+ * This Mac's own folder only with hellomerle.com: a hook run for any other Merle (a test) with no folder of its own
+ * writes nothing (the P0 of 22 Nov; merle-runner.mjs homeRefusal).
+ */
+const OFF =
+  process.env.MERLE_RUNNER_HOME === undefined &&
+  process.env.MERLE_URL !== undefined &&
+  process.env.MERLE_URL !== 'https://app.hellomerle.com';
 export const SPOOL = join(HOME, 'spool');
 export const SPOOL_FILE = join(SPOOL, 'events.jsonl');
 /** A marker the runner watches: send now, not at the next look (waiting at the Mac, a session ending, a failure). */
@@ -309,7 +317,7 @@ export function namedFact(input, now, r) {
   return fact;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (!OFF && process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const input = JSON.parse(readFileSync(0, 'utf8'));
     // An agent's name goes only with its start and its going idle, and only while this Mac reads its sessions.

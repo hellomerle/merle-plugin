@@ -41,6 +41,46 @@ export const MERLE = process.env.MERLE_URL ?? 'https://app.hellomerle.com';
 export const HOME =
   process.env.MERLE_RUNNER_HOME ?? join(homedir(), 'Library', 'Application Support', 'Merle');
 const CONFIG = join(HOME, 'runner.json');
+/** Two folders are one when their real paths are, as this Mac's disk compares them (no case on darwin). */
+const same = (a, b) => {
+  const real = (p) => {
+    let r = resolve(p);
+    try {
+      r = realpathSync(r);
+    } catch {}
+    return process.platform === 'darwin' ? r.toLowerCase() : r;
+  };
+  return real(a) === real(b);
+};
+/** The one Merle this Mac's own folder, its Keychain pairing and its logs are for. */
+const PROD = 'https://app.hellomerle.com';
+const REAL_HOME = join(homedir(), 'Library', 'Application Support', 'Merle');
+const REAL_LOGS = join(homedir(), 'Library', 'Logs', 'Merle');
+/**
+ * Why this runner must not touch its folder, its pairing or its log now, or null (a test run reached the founder's
+ * real folder, 22 Nov). An allowlist: this Mac's own folder, Keychain and logs only with hellomerle.com.
+ * - Loaded for one folder (HOME is fixed when the file loads) while MERLE_RUNNER_HOME now names another.
+ * - This Mac's own folder with any other Merle (a test edge, however its address is written).
+ * - Another folder writing this Mac's own logs (MERLE_RUNNER_LOG unset).
+ * - The Keychain's pairing (MERLE_KEYCHAIN_FILE unset) with another folder or another Merle.
+ */
+export function homeRefusal(env = process.env, keychain = false) {
+  const asked = env.MERLE_RUNNER_HOME;
+  if (asked !== undefined && !same(asked, HOME)) return 'it was loaded for another folder';
+  const prod = MERLE === PROD && (env.MERLE_URL === undefined || env.MERLE_URL === PROD);
+  const real = same(HOME, REAL_HOME);
+  if (real && !prod) return 'this Mac’s own folder is for hellomerle.com only';
+  if (!real && (same(dirname(LOG), REAL_LOGS) || same(dirname(READING_LOG), REAL_LOGS)))
+    return 'another folder needs a log of its own';
+  if (keychain && !env.MERLE_KEYCHAIN_FILE && (!real || !prod))
+    return 'the Keychain’s pairing is for this Mac’s own folder only';
+  return null;
+}
+/** Throws before the runner reads or writes its folder or its pairing when homeRefusal says no. */
+const guardHome = (keychain = false) => {
+  const why = homeRefusal(process.env, keychain);
+  if (why) throw Error(`Merle's runner won't run here: ${why}.`);
+};
 /** The jobs this Mac started, by job id: its own record, so a stop names only a session it started (docs/runs.md). */
 const JOBS = join(HOME, 'jobs.json');
 /** Nonces of the jobs this Mac took, each kept until its job's expiry: a job runs once. */
@@ -292,6 +332,7 @@ export async function passkeySays(pin, kind, ask, nonces, say = console.log) {
 const KEYCHAIN = 'merle-runner';
 /** What pairing kept in the Keychain: the runner id, its token, the pinned passkey and Merle's origin; or null. */
 export const kept = () => {
+  guardHome(true);
   if (process.env.MERLE_KEYCHAIN_FILE) {
     try {
       return JSON.parse(readFileSync(process.env.MERLE_KEYCHAIN_FILE, 'utf8'));
@@ -306,6 +347,7 @@ export const kept = () => {
 };
 /** Writes what pairing keeps (null removes it): the Keychain item, or the test file. */
 export const keep = (v) => {
+  guardHome(true);
   if (process.env.MERLE_KEYCHAIN_FILE) {
     writeFileSync(process.env.MERLE_KEYCHAIN_FILE, JSON.stringify(v), { mode: 0o600 });
     return;
@@ -439,6 +481,7 @@ function updateReading(change) {
 }
 /** One line in the reading log. Throws if it can't. */
 export function readingLog(entry) {
+  guardHome();
   mkdirSync(dirname(READING_LOG), { recursive: true });
   appendFileSync(READING_LOG, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`, {
     mode: 0o600,
@@ -583,6 +626,7 @@ const printableLines = (x) => {
 
 /** The jobs this Mac started: job id to its session's short id, repo path and ref. Unreadable reads as none. */
 export const started = () => {
+  guardHome();
   try {
     const v = JSON.parse(readFileSync(JOBS, 'utf8'));
     return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
@@ -591,6 +635,7 @@ export const started = () => {
   }
 };
 const startedKeep = (id, rec) => {
+  guardHome();
   mkdirSync(HOME, { recursive: true });
   // A month of jobs is plenty to stop or follow; older ones go.
   const cut = Date.now() - 30 * 24 * 3_600_000;
@@ -623,6 +668,7 @@ export const repoFor = (cwd) => {
   return (remote && repos.find((r) => r.remote === remote)) || null;
 };
 export const config = () => {
+  guardHome();
   try {
     return { repos: [], max: 3, paused: false, ...JSON.parse(readFileSync(CONFIG, 'utf8')) };
   } catch {
@@ -636,6 +682,7 @@ const save = (c) => {
 
 /** One line in the local log. Throws if it can't: no work happens without it. */
 export function log(entry) {
+  guardHome();
   mkdirSync(dirname(LOG), { recursive: true });
   appendFileSync(LOG, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`, { mode: 0o600 });
 }
@@ -914,6 +961,9 @@ let flushing = null;
  * took is deleted; what it didn't, or couldn't, waits for the next time.
  */
 export function flushEvents(now = Date.now(), force = false) {
+  // A refusal as a failed flush, never a throw out of a watcher's callback.
+  const why = homeRefusal();
+  if (why) return Promise.reject(Error(`Merle's runner won't run here: ${why}.`));
   if (flushing) return flushing;
   let asked = false;
   try {
@@ -1046,6 +1096,7 @@ const AGENT_KEY = /^sub-[0-9a-f]{8}$/;
  * Merle, nobody could resume one.
  */
 export function clearPauses() {
+  guardHome();
   let names = [];
   try {
     names = readdirSync(SESSIONS);
@@ -1085,6 +1136,7 @@ export function pauseRefusal(p) {
 }
 /** Applies one pause or resume: the file written whole, or taken away; false when a newer one is on file. Throws if it can't. */
 export function applyPause(p, now = Date.now()) {
+  guardHome();
   const f = pauseFile(p.session, p.agent);
   // A newer change already on file (another runner process got there first) is never undone by an older one.
   if ((pausedRev(p.session, p.agent) ?? 0) > p.rev) return false;
