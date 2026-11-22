@@ -442,6 +442,28 @@ const checkin = (pin, input, event, client) =>
       await import('./event.mjs').then((e) => e.spool(e.factOf(input), input.cwd)).catch(() => false);
     return r;
   });
+/**
+ * Each of this session's helpers' own pause files here, by its key and the rev in it (50 at most), so Merle keeps in
+ * step with the Mac (checkinAgentPauses, the steer coverage 2.6). An empty list when there are none; nothing at all
+ * when the folder can't be read, so Merle changes nothing on a word it can't trust.
+ */
+export function agentPausesHere(session) {
+  if (typeof session !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(session)) return undefined;
+  const file = new RegExp(`^${session}\\.(sub-[0-9a-f]{8})\\.paused$`);
+  let names;
+  try {
+    names = readdirSync(SESSIONS);
+  } catch (err) {
+    return err?.code === 'ENOENT' || err?.code === 'ENOTDIR' ? [] : undefined;
+  }
+  return names
+    .flatMap((n) => {
+      const agent = file.exec(n)?.[1];
+      const rev = agent ? pausedRev(session, agent) : null;
+      return agent && rev !== null ? [{ agent, rev }] : [];
+    })
+    .slice(0, 50);
+}
 const postCheckin = (pin, input, event, client) =>
   api(pin, '/v1/runner/hook/checkin', {
     method: 'POST',
@@ -460,6 +482,8 @@ const postCheckin = (pin, input, event, client) =>
       // Claude Code's plugin holds the pause gate (pause-gate.mjs, its PreToolUse hook): Merle offers Pause only then.
       // And whether this session's pause file is here, by the rev in it, so Merle never disagrees with the Mac for long.
       ...(client === undefined ? { gate: true, paused: pausedRev(input.session_id) } : {}),
+      // And each helper's own pause file, so Merle keeps those in step too.
+      ...(client === undefined ? { agentPauses: agentPausesHere(input.session_id) } : {}),
       // And its own teammates' hooks take a note to one of them (agent-note): only Claude Code's plugin has them.
       ...(client === undefined ? { notes: 2 } : {}),
       // And its gate (pause-gate.mjs, this same plugin) reads one teammate's own pause file.
