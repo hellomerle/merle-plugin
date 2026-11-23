@@ -823,7 +823,14 @@ async function hook(what, short) {
   }
   if (typeof session !== 'string' || !SESSION_ID.test(session)) return 1;
   // Unhooked here first, so nothing reaches it even if Merle doesn't answer; hooked up here only once Merle has.
-  if (what === 'unhook') saveLocal(short, { unhooked: true });
+  if (what === 'unhook') {
+    saveLocal(short, { unhooked: true });
+    // Its Agent calls held for their helpers' tasks go too, with their lock, mark and any stale lock moved aside.
+    try {
+      for (const n of readdirSync(join(HOME, 'pending')))
+        if (n.startsWith(`${short}.`)) rmSync(join(HOME, 'pending', n), { force: true });
+    } catch {}
+  }
   await api(pin, `/v1/runner/hook/${what}`, { method: 'POST', body: JSON.stringify({ session }) });
   if (what === 'hookup') saveLocal(short, { unhooked: false });
   console.log(

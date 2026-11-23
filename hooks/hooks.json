@@ -1,5 +1,5 @@
 {
-  "description": "After a Bash command that looks like a deploy, remind the agent that only a production deploy that worked should tell Merle it's live. On a Mac paired with Merle, hook up each session so the founder's notes from Merle reach it: a check-in at start, a look for a note at the end of each turn, and a waiting hook that wakes an idle session when one comes; a note to one of its teammates is looked for only by that teammate's own hooks, as it takes a message and as it ends a turn. While the person who paired the Mac has paused a session from Merle, a check before each tool refuses it and ends the turn. When a session waits on a permission prompt, Merle is told it waits at the Mac, with the tool's name only; the prompt is answered on the Mac. Only if the person who paired the Mac turned session reading on there with Touch ID, the end of each turn sends Merle a scrubbed extract of the session's own words (with its question, plan and to-do words; never any other tool's input or output). Each event in a hooked-up session also leaves one fact on this Mac's spool (what happened and when: a prompt's length, a tool's name and whether it worked, a commit, push, pull request or test run by a fixed word; never a word, a command, a path or a tool's input or output), which the runner sends to Merle.",
+  "description": "After a Bash command that looks like a deploy, remind the agent that only a production deploy that worked should tell Merle it's live. On a Mac paired with Merle, hook up each session so the founder's notes from Merle reach it: a check-in at start, a look for a note at the end of each turn, and a waiting hook that wakes an idle session when one comes; a note to one of its teammates is looked for only by that teammate's own hooks, as it takes a message and as it ends a turn. While the person who paired the Mac has paused a session from Merle, a check before each tool refuses it and ends the turn. When a session waits on a permission prompt, Merle is told it waits at the Mac, with the tool's name only; the prompt is answered on the Mac. Only if the person who paired the Mac turned session reading on there with Touch ID, the end of each turn sends Merle a scrubbed extract of the session's own words (with its question, plan and to-do words; never any other tool's input or output). Under reading too, a helper's name and the one-line task its Agent call gave it (never that call's prompt) go with the session's events: an Agent call is held on this Mac before it runs, and the one helper that starts next takes its task. Each event in a hooked-up session also leaves one fact on this Mac's spool (what happened and when: a prompt's length, a tool's name and whether it worked, a commit, push, pull request or test run by a fixed word; never a word, a command, a path or a tool's input or output, except, under reading, a helper's name and its one-line task), which the runner sends to Merle.",
   "hooks": {
     "PostToolUse": [
       {
@@ -54,6 +54,16 @@
       }
     ],
     "PreToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/event.mjs\"",
+            "timeout": 5
+          }
+        ]
+      },
       {
         "hooks": [
           {

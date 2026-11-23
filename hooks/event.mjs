@@ -8,13 +8,27 @@
  * exit code), never a command (a commit, a push, a pull request or a test run is read from the command's first words
  * and named by a fixed word), never a path (a line with an agent's name keeps its hook's folder in the spool, for the
  * runner to check again, and the runner takes it off before sending). A subagent is its id and type, so each builder
- * is its own row in Merle.
+ * is its own row in Merle. The one exception, only under session reading (docs/sessions.md): a helper's name, and the
+ * one-line task its Agent call gave it (that call's `description`, never its `prompt`), on its own start line.
  *
  * Only for a session this Mac hooked up (session-hook.mjs left its record), and the spool never grows past SPOOL_MAX:
  * past it, events are left out until the runner has sent what's there.
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -133,11 +147,36 @@ export function actsOf(command) {
 
 const int = (n, max) => (Number.isSafeInteger(n) && n >= 0 && n <= max ? n : undefined);
 
+/** The most a helper's name or task is, in characters (code points, so a pair is never split). */
+export const LINE_MAX = 80;
+/**
+ * Words from the Mac as reading renders them, for a helper's row: quoted or indented code stays on the Mac (a backtick,
+ * a ~~~ fence, a line indented four or a tab), settings are cut to their names, then the whole is scrubbed and folded to
+ * one line before it is cut (so a cut never leaves part of an address the scrubber would have known), to LINE_MAX
+ * characters, a cut-off last word dropped. Empty when nothing may go.
+ */
+export const oneLine = (said) => {
+  // Anything longer stays on the Mac: never cut before it is scrubbed (the second pass).
+  const raw = String(said);
+  if (raw.length > 4000 || /`|~~~|^ {4}|\t/m.test(raw)) return '';
+  const sc = scrubber();
+  const all = sc
+    .plain(sc.text(settings(raw)))
+    .replace(/\s+/g, ' ')
+    .trim();
+  const chars = [...all];
+  if (chars.length <= LINE_MAX) return all;
+  const cut = chars.slice(0, LINE_MAX).join('');
+  const space = cut.lastIndexOf(' ');
+  return space > 0 ? cut.slice(0, space).trim() : cut;
+};
+
 /**
  * Claude Code's hook input as one fact, or null for an event it says nothing about. The first adapter: another agent's
- * hooks map their own events to the same facts.
+ * hooks map their own events to the same facts. `o.task` is a helper's task, held for its start (taskFor): only on
+ * that start's line, only with `o.names`.
  */
-export function factOf(input, now = Date.now(), o = { names: false }) {
+export function factOf(input, now = Date.now(), o = { names: false, task: '' }) {
   const session = input?.session_id;
   if (typeof session !== 'string' || !SESSION.test(session)) return null;
   const at = now;
@@ -153,22 +192,12 @@ export function factOf(input, now = Date.now(), o = { names: false }) {
   const said = o.names
     ? [input.agent_type, input.teammate_name].find((x) => typeof x === 'string' && x.trim())
     : null;
-  const sc = said ? scrubber() : null;
-  // As reading renders words: quoted or indented code stays on the Mac (a backtick, a ~~~ fence, a line indented four
-  // or a tab), settings are cut to their names, then scrubbed and folded to one line (the second pass).
-  const raw = said ? String(said).slice(0, 400) : '';
-  const code = /`|~~~|^ {4}|\t/m.test(raw);
-  const name =
-    sc && !code
-      ? sc
-          .plain(sc.text(settings(raw)))
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(0, 80)
-      : '';
+  const name = said ? oneLine(said) : '';
   const named = agentId ? { agent: { ...agent.agent, ...(name ? { name } : {}) } } : {};
   const toolName = String(input.tool_name ?? '');
   const tool = toolName.startsWith('mcp__') ? 'mcp' : TOOLS.includes(toolName) ? toolName : 'other';
+  // Its one-line task, on its start only: what its Agent call said it was for (the founder, 23 Nov).
+  const task = o.names && o.task ? oneLine(o.task) : '';
   switch (input.hook_event_name) {
     case 'SessionStart':
       return {
@@ -231,7 +260,9 @@ export function factOf(input, now = Date.now(), o = { names: false }) {
     case 'Stop':
       return { ...base, ...agent, e: 'stop' };
     case 'SubagentStart':
-      return agentId ? { ...base, ...named, e: 'sub_start' } : null;
+      return agentId
+        ? { ...base, agent: { ...named.agent, ...(task ? { task } : {}) }, e: 'sub_start' }
+        : null;
     case 'SubagentStop':
       return agentId ? { ...base, ...agent, e: 'sub_stop' } : null;
     // An in-process teammate's turn ends with TeammateIdle (SubagentStart opens each one): its own stop, by its own id.
@@ -278,7 +309,7 @@ export async function spool(fact, cwd) {
     size = statSync(SPOOL_FILE).size;
   } catch {}
   // A named line keeps the folder its hook ran in, for the runner to check again when it sends; never sent.
-  const line = `${JSON.stringify(fact.agent?.name ? { ...fact, here: cwd } : fact)}\n`;
+  const line = `${JSON.stringify(fact.agent?.name || fact.agent?.task ? { ...fact, here: cwd } : fact)}\n`;
   if (size + line.length > SPOOL_MAX) return false;
   appendFileSync(SPOOL_FILE, line, { mode: 0o600 });
   if (fact.e === 'wait' || fact.e === 'end' || (fact.e === 'tool' && !fact.ok && fact.acts?.includes('test')))
@@ -291,28 +322,201 @@ export async function spool(fact, cwd) {
  * session's short id, its hash and its length, never the words, so the person can see words left the Mac.
  */
 export function nameLog(fact, log) {
-  const name = fact?.agent?.name;
-  if (typeof name !== 'string' || !name) return;
-  log({
-    event: 'agent_name',
-    session: shortOf(fact.session),
-    sha256: createHash('sha256').update(name).digest('hex'),
-    chars: name.length,
-  });
+  for (const [event, words] of [
+    ['agent_name', fact?.agent?.name],
+    ['agent_task', fact?.agent?.task],
+  ])
+    if (typeof words === 'string' && words)
+      log({
+        event,
+        session: shortOf(fact.session),
+        sha256: createHash('sha256').update(words).digest('hex'),
+        chars: words.length,
+      });
 }
 
 /**
- * The fact for a hook's input, with its agent's name only while this Mac reads its sessions (`r`, the runner) and only
- * once its line in reading.jsonl is written: a log it can't write, and no name goes (as reading does).
+ * The Agent calls a session made whose helper hasn't started yet, on this Mac only (`pending/<short id>.json`, its
+ * owner's alone): each call's id, when, and its one-line task only while reading may send it. Read and written under a
+ * lock made with O_EXCL (`.lock`), so two calls at once never lose one; a hook that can't take the lock leaves a mark
+ * (`.unsure`) instead, and no start takes a task while it's fresh. A helper's start takes the task only from the one
+ * call made in the PAIR_MS before it: none when two fell inside that window (which is whose can't be told), and none
+ * from a call held longer (one refused before it ran never meets a helper resumed or forked later). A call goes when a
+ * helper takes it, when it failed, or once older than the window. All of it goes when reading goes off, or the session
+ * is unhooked here.
+ */
+const PENDING = join(HOME, 'pending');
+export const PAIR_MS = 10_000;
+const pendingFile = (session, ext = 'json') => join(PENDING, `${shortOf(session)}.${ext}`);
+const pendingOf = (session, now) => {
+  try {
+    const v = JSON.parse(readFileSync(pendingFile(session), 'utf8'));
+    return v?.session === session && Array.isArray(v.calls)
+      ? v.calls.filter(
+          (c) =>
+            typeof c?.id === 'string' &&
+            Number.isSafeInteger(c.at) &&
+            c.at <= now + 1000 &&
+            now - c.at <= PAIR_MS,
+        )
+      : [];
+  } catch {
+    return [];
+  }
+};
+/** `change` on this session's held calls, under the lock; false when the lock couldn't be taken (and the mark is left). */
+/**
+ * Takes this session's lock: a file made with O_EXCL holding a token of this process's own, so only its holder removes
+ * it. One older than five seconds was left by a hook that died: it is moved aside under a name of the taker's own, and
+ * taken over only if what moved is still that stale lock (another taker's fresh one is put back). Null when it can't.
+ */
+const takeLock = (lock) => {
+  const token = randomBytes(8).toString('hex');
+  for (const t = Date.now(); Date.now() - t < 500; ) {
+    try {
+      const fd = openSync(lock, 'wx', 0o600);
+      writeSync(fd, token);
+      closeSync(fd);
+      return token;
+    } catch {}
+    try {
+      const st = statSync(lock);
+      if (Date.now() - st.mtimeMs > 5_000) {
+        const was = readFileSync(lock, 'utf8');
+        const aside = `${lock}.${token}`;
+        renameSync(lock, aside);
+        // What moved is a fresh lock another hook took meanwhile: back where it was, if the place is still free.
+        if (readFileSync(aside, 'utf8') !== was)
+          try {
+            linkSync(aside, lock);
+          } catch {}
+        rmSync(aside, { force: true });
+        continue;
+      }
+    } catch {}
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); // honesty: waits for the lock; moves no stage
+  }
+  return null;
+};
+/** Gives the lock back, only while it still holds this taker's token. */
+const dropLock = (lock, token) => {
+  try {
+    if (readFileSync(lock, 'utf8') === token) rmSync(lock, { force: true });
+  } catch {}
+};
+/** `change` on this session's held calls, under the lock; false when the lock couldn't be taken (and the mark is left). */
+const withPending = (session, now, change) => {
+  mkdirSync(PENDING, { recursive: true, mode: 0o700 });
+  const lock = pendingFile(session, 'lock');
+  const token = takeLock(lock);
+  if (!token) {
+    writeFileSync(pendingFile(session, 'unsure'), String(now), { mode: 0o600 });
+    return false;
+  }
+  try {
+    const out = change(pendingOf(session, now));
+    writeFileSync(pendingFile(session), JSON.stringify({ session, calls: out.calls.slice(-20) }), {
+      mode: 0o600,
+    });
+    return 'value' in out ? out.value : true;
+  } finally {
+    dropLock(lock, token);
+  }
+};
+/** A hook couldn't take the lock lately: no start takes a task for PAIR_MS. */
+const unsure = (session, now) => {
+  try {
+    return now - Number(readFileSync(pendingFile(session, 'unsure'), 'utf8')) <= PAIR_MS;
+  } catch {
+    return false;
+  }
+};
+const isAgentCall = (input) => input?.tool_name === 'Agent' || input?.tool_name === 'Task';
+/**
+ * Holds an Agent call until its helper starts (PreToolUse), or lets it go when the call failed (PostToolUseFailure: no
+ * helper came of it). Never on its success: a background helper's call answers as it starts, its start's own hook may
+ * still be reading. `task` is its cleaned line, empty when reading may not send it: the call is held either way, so
+ * the count of calls in the window stays true.
+ */
+export function holdCall(input, now, task = '') {
+  const session = input?.session_id;
+  if (typeof session !== 'string' || !SESSION.test(session) || !isAgentCall(input) || !hooked(session))
+    return;
+  const id = String(input.tool_use_id ?? '').slice(0, 200);
+  if (!id) return;
+  withPending(session, now, (calls) => ({
+    calls: [
+      ...calls.filter((c) => c.id !== id),
+      ...(input.hook_event_name === 'PreToolUse' ? [{ id, at: now, ...(task ? { task } : {}) }] : []),
+    ],
+  }));
+}
+/**
+ * The task for a helper starting now, with when it was held: the one Agent call made in the window before it, taken;
+ * none when another fell inside it, when a hook couldn't take the lock lately, or when the session isn't hooked here.
+ */
+export function taskFor(session, now) {
+  if (typeof session !== 'string' || !SESSION.test(session) || !hooked(session)) return null;
+  const got = withPending(session, now, (calls) => {
+    // Under the lock, so a hook that missed it while this one waited has left its mark by now.
+    if (unsure(session, now)) return { calls, value: null };
+    const near = calls.filter((c) => c.at <= now);
+    if (near.length !== 1) return { calls, value: null };
+    const [one] = near;
+    return { calls: calls.filter((c) => c !== one), value: one };
+  });
+  return got && typeof got === 'object' && typeof got.task === 'string'
+    ? { task: got.task, at: got.at }
+    : null;
+}
+
+/**
+ * The fact for a hook's input, with its agent's name (and, on its start, its task) only while this Mac reads its
+ * sessions (`r`, the runner) and only once its line in reading.jsonl is written: a log it can't write, and no words go
+ * (as reading does). A task only under a reading-on signed with the words that name tasks (`readingTasks`).
  */
 export function namedFact(input, now, r) {
-  const names = !!r && r.readingOn() && !r.readingLeftOut(input?.cwd);
-  const fact = factOf(input, now, { names });
-  if (fact?.agent?.name)
+  // A runner that can't say (it refuses this folder, its Keychain won't read): off, and the call is still held.
+  const asks = (f) => {
+    try {
+      return f() === true;
+    } catch {
+      return false;
+    }
+  };
+  const names = !!r && asks(() => r.readingOn() && !r.readingLeftOut(input?.cwd));
+  const tasks = names && asks(() => r.readingTasks());
+  const event = input?.hook_event_name;
+  // Nothing is held while this Mac doesn't read: a failed call only lets go of one held while it did.
+  if (isAgentCall(input) && ((names && event === 'PreToolUse') || event === 'PostToolUseFailure'))
+    try {
+      const said = input.tool_input?.description;
+      if (event === 'PreToolUse' || existsSync(pendingFile(input.session_id)))
+        holdCall(
+          input,
+          now,
+          tasks && event === 'PreToolUse' && typeof said === 'string' ? oneLine(said) : '',
+        );
+    } catch {}
+  let held = null;
+  if (names && event === 'SubagentStart')
+    try {
+      held = taskFor(input.session_id, now);
+    } catch {}
+  // Only a task held since reading last went on here: one captured before an off and on again never goes.
+  let since = null;
+  if (held && tasks)
+    try {
+      since = r.readingSince();
+    } catch {}
+  const task = held && tasks && Number.isSafeInteger(since) && held.at >= since ? held.task : '';
+  const fact = factOf(input, now, { names, task });
+  if (fact?.agent?.name || fact?.agent?.task)
     try {
       nameLog(fact, r.readingLog);
     } catch {
       delete fact.agent.name;
+      delete fact.agent.task;
     }
   return fact;
 }
@@ -320,9 +524,12 @@ export function namedFact(input, now, r) {
 if (!OFF && process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const input = JSON.parse(readFileSync(0, 'utf8'));
-    // An agent's name goes only with its start and its going idle, and only while this Mac reads its sessions.
+    // An agent's name goes only with its start and its going idle, its task only with its start, and only while this
+    // Mac reads its sessions; an Agent call is held (PreToolUse) until its helper starts.
     const r =
-      input?.hook_event_name === 'SubagentStart' || input?.hook_event_name === 'TeammateIdle'
+      input?.hook_event_name === 'SubagentStart' ||
+      input?.hook_event_name === 'TeammateIdle' ||
+      (input?.hook_event_name === 'PreToolUse' && isAgentCall(input))
         ? await import('../runner/merle-runner.mjs').catch(() => null)
         : null;
     const fact = namedFact(input, Date.now(), r);
