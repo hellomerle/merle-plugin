@@ -1,8 +1,11 @@
 // Generated from Merle's own scrubber (scrub.ts) when the plugin is built. Don't edit it here.
-const PLACEHOLDER = /[[(](email|phone|number|id|name)(?: (\d+))?[\])]/gi;
-const canon = (kind, n) => `[${kind.toLowerCase()}${n ? ` ${n}` : ""}]`;
-const FILE = /^[a-z0-9_-]+\.(?:sh|html?|js|mjs|cjs|css|pdf|png|jpe?g|gif|svg|webp|json|xml|txt|csv|zip|md|ico|map|wasm)$/i;
-const PERSONAL = /* @__PURE__ */ new Set([
+var IBAN_RE = /\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{2,4}){3,9}\b/g;
+var CARD_RE = /\b(?:\d[\s_/·‑-]?){12,18}\d\b/g;
+
+var PLACEHOLDER = /[[(](email|phone|number|id|name)(?: (\d+))?[\])]/gi;
+var canon = (kind, n) => `[${kind.toLowerCase()}${n ? ` ${n}` : ""}]`;
+var FILE = /^[a-z0-9_-]+\.(?:sh|html?|js|mjs|cjs|css|pdf|png|jpe?g|gif|svg|webp|json|xml|txt|csv|zip|md|ico|map|wasm)$/i;
+var PERSONAL = /* @__PURE__ */ new Set([
   "customers",
   "customer",
   "users",
@@ -41,8 +44,8 @@ const PERSONAL = /* @__PURE__ */ new Set([
   "cuenta",
   "cuentas"
 ]);
-const LB = "";
-const starts = (before, body, flags) => ({
+var LB = "";
+var starts = (before, body, flags) => ({
   re: new RegExp(
     body.replace(LB, () => `(?<!${before})`),
     `g${flags}`
@@ -52,7 +55,7 @@ const starts = (before, body, flags) => ({
     `y${flags}`
   )
 });
-const chained = (r, t, kind, rank, out) => {
+var chained = (r, t, kind, rank, out) => {
   r.re.lastIndex = 0;
   for (let m = r.re.exec(t); m; m = r.re.exec(t)) {
     let e = m.index + m[0].length;
@@ -69,7 +72,7 @@ const chained = (r, t, kind, rank, out) => {
   }
   return out;
 };
-const after = (r, t, kind, rank, out) => {
+var after = (r, t, kind, rank, out) => {
   let end = -1;
   for (const m of t.matchAll(r.head)) {
     const p = (m.index ?? 0) + m[0].length;
@@ -91,7 +94,7 @@ const after = (r, t, kind, rank, out) => {
   }
   return out;
 };
-const PERSON = [
+var PERSON = [
   // A class that names a person the same way ("div.profile-zoe-keller", "a.user-zoe"), unless what follows is one word
   // a page names its own parts by ("a.user-menu", "div.profile-picture").
   [
@@ -108,12 +111,12 @@ const PERSON = [
     "name"
   ]
 ];
-const quote = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const anyCase = (w) => w.replace(/[a-z]/g, (c) => `[${c.toUpperCase()}${c}]`);
-const SECRET_NAME = new RegExp(
+var quote = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+var anyCase = (w) => w.replace(/[a-z]/g, (c) => `[${c.toUpperCase()}${c}]`);
+var SECRET_NAME = new RegExp(
   `(?:${["key", "token", "secret", "password", "passwd", "passphrase", "pass", "pwd", "auth", "credentials?"].map(anyCase).join("|")})(?:_|[A-Z]|$)`
 );
-const NOT_A_VALUE = `
+var NOT_A_VALUE = `
 the a an my our your their his her its this that these those it them me you us him be is was and or not no
 never also just still all any every each some one both too very only already now then there log login sign
 access reset change get use unlock open enter make keep set protect prevent avoid stop match see check do
@@ -122,16 +125,16 @@ missing weak strong short long leaked stolen compromised updated saved sent lost
 fixed removed deleted typed entered used shared given emailed stored hashed case required needed blocked
 locked
 `.trim().split(/\s+/);
-const SECRETY = String.raw`\S{0,40}[\d=+/!@#$%^&*]|\p{L}{16}`;
-const VALUE_AFTER_TO = (() => {
+var SECRETY = String.raw`\S{0,40}[\d=+/!@#$%^&*]|\p{L}{16}`;
+var VALUE_AFTER_TO = (() => {
   const word = String.raw`(?=\S)(?:(?!(?:${NOT_A_VALUE.join("|")})[.,;:!?)\]"'”’…—]*(?!\S))|(?=${SECRETY}))`;
   return String.raw`(?=:\s*${word}|(?!:)${word}|${SECRETY})`;
 })();
-const PROSE_VALUE = { value: /(?::\s*)?\S{4,}/y, run: /(?::\s*)?\S*/y, lead: /:\s/y };
-const PASSWORD_FOR = [0, 1, 2, 3].map(
+var PROSE_VALUE = { value: /(?::\s*)?\S{4,}/y, run: /(?::\s*)?\S*/y, lead: /:\s/y };
+var PASSWORD_FOR = [0, 1, 2, 3].map(
   (k) => String.raw`\bpass(?:word|wort)${k ? String.raw`\s+(?:for|für)(?:\s+[\p{L}\p{N}_.'’()/-]{1,40}){${k}}` : ""}\s*`
 );
-const CREDENTIALS = [
+var CREDENTIALS = [
   // Tokens: API keys, GitHub tokens, JWTs, bearer values.
   // A private key, whole: the markers and everything between them.
   [
@@ -208,7 +211,7 @@ const CREDENTIALS = [
   ],
   [{ head: /\bBearer\s+/gi, value: /[A-Za-z0-9._~+/=-]*/y, min: 8 }, "id"]
 ];
-const RULES = [
+var RULES = [
   // An element id or data attribute that names a person: what the button makes of the host page's own ids.
   [/#(?:user|customer|account|member|profile|client|person|contact|kunde)[-_][\w.-]+/gi, "id", "first"],
   [
@@ -257,9 +260,9 @@ const RULES = [
   [/\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{12,15}\b/gi, "id"],
   [/\b\d{1,3}(?:\s?\.\s?\d{1,3}){3}\b/g, "id"],
   // An IBAN: two letters, two check digits, then 11 to 30 letters and digits (spaces allowed in groups).
-  [/\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{2,4}){3,9}\b/g, "number"],
+  [IBAN_RE, "number"],
   // A card: 13 to 19 digits, in groups or not.
-  [/\b(?:\d[\s_/·‑-]?){12,18}\d\b/g, "number"],
+  [CARD_RE, "number"],
   [/\b(?:\d{4}[ ,.-]\s?){3}\d{4}\b/g, "number"],
   // A phone: a + or 00 and at least 7 more digits with the usual separators, or a national 0-prefixed number.
   [/(?:\+|\b00)\d[\d\s()._/·‑-]{6,}\d/g, "phone"],
@@ -481,18 +484,18 @@ function scrubber(known = []) {
   });
   return { text, path, restore, plain, words, clean, cleanPath, cleanTrail, cleanReport };
 }
-const WORDS = {
+var WORDS = {
   email: "an email address",
   phone: "a phone number",
   number: "a number",
   id: "an id"
   // A name stays `[name]`: "the customer from the customer" would read worse than the bracket.
 };
-const inWords = (s) => s.replace(
+var inWords = (s) => s.replace(
   /(\/)?\[(email|phone|number|id)\]/gi,
   (m, slash, kind) => slash ? m : WORDS[kind.toLowerCase()] ?? m
 );
-const hasPlaceholder = (s) => new RegExp(PLACEHOLDER.source, "i").test(s);
+var hasPlaceholder = (s) => new RegExp(PLACEHOLDER.source, "i").test(s);
 export {
   hasPlaceholder,
   inWords,
