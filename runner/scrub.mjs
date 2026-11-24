@@ -1,6 +1,47 @@
 // Generated from Merle's own scrubber (scrub.ts) when the plugin is built. Don't edit it here.
 var IBAN_RE = /\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{2,4}){3,9}\b/g;
 var CARD_RE = /\b(?:\d[\s_/·‑-]?){12,18}\d\b/g;
+var luhn = (digits) => {
+  let sum = 0;
+  for (let i = 0; i < digits.length; i++) {
+    let n = Number(digits[digits.length - 1 - i]);
+    if (i % 2) n = n > 4 ? n * 2 - 9 : n * 2;
+    sum += n;
+  }
+  return sum % 10 === 0;
+};
+var IBAN_LENGTH = Object.fromEntries(
+  "AD24AE23AL28AT20AZ28BA20BE16BG22BH22BI27BR29BY28CH21CR22CY28CZ24DE22DJ27DK18DO28EE20EG29ES24FI18FK18FO18FR27GB22GE22GI23GL18GR27GT28HN28HR21HU28IE22IL23IQ23IS26IT27JO30KW30KZ20LB28LC32LI21LT20LU20LV21LY25MC27MD24ME22MK19MN20MR27MT31MU30NI28NL18NO15OM23PK24PL28PS29PT25QA29RO24RS22RU33SA24SC31SD18SE24SI19SK24SM27SO23ST25SV28TL23TN24TR26UA29VA22VG24XK20YE30".match(/[A-Z]{2}\d{2}/g)?.map((x) => [x.slice(0, 2), Number(x.slice(2))]) ?? []
+);
+var ibanOk = (s) => {
+  const v = s.toUpperCase();
+  if (IBAN_LENGTH[v.slice(0, 2)] !== v.length || v.replace(/\D/g, "").length < 8) return false;
+  let n = 0;
+  for (const c of v.slice(4) + v.slice(0, 4)) n = Number(`${n}${Number.parseInt(c, 36)}`) % 97;
+  return n === 1;
+};
+var cardOk = (raw) => {
+  const v = raw.replace(/\D/g, "");
+  return v.length >= 13 && v.length <= 19 && /^(?:[3-6]|2[2-7])/.test(v) && !/\b\d{1,2}([^\d])\d{1,2}\1\d{4}\b/.test(raw) && luhn(v);
+};
+var LOOSE = /\b[a-z]{2}\d{2}(?: ?[a-z\d]){11,30}\b|\b\d(?:[\s_/·\u2010-\u2015\u2212\uff0d-]?\d){12,18}\b/gi;
+var loosePayment = (t) => {
+  const out = [];
+  LOOSE.lastIndex = 0;
+  for (let m = LOOSE.exec(t), n = 0; m && n < 2e3; m = LOOSE.exec(t), n++) {
+    const card = /\d/.test(m[0][0] ?? "");
+    let end = 0;
+    for (let k = m[0].length; k >= 13 && !end; k--) {
+      const whole = k === m[0].length || /[^a-z\d]/i.test(m[0][k] ?? "");
+      const v = m[0].slice(0, k);
+      if (!whole || /[^a-z\d]/i.test(v.at(-1) ?? "")) continue;
+      if (card ? cardOk(v) : ibanOk(v.replaceAll(" ", ""))) end = k;
+    }
+    if (end) out.push({ s: m.index, e: m.index + end });
+    LOOSE.lastIndex = m.index + (end || 1);
+  }
+  return out;
+};
 
 var PLACEHOLDER = /[[(](email|phone|number|id|name)(?: (\d+))?[\])]/gi;
 var canon = (kind, n) => `[${kind.toLowerCase()}${n ? ` ${n}` : ""}]`;
@@ -126,6 +167,9 @@ fixed removed deleted typed entered used shared given emailed stored hashed case
 locked
 `.trim().split(/\s+/);
 var SECRETY = String.raw`\S{0,40}[\d=+/!@#$%^&*]|\p{L}{16}`;
+var REPEATED = /^(?!(?:19|20)\d\d(?:-\d\d-\d\d)?$)\S{0,40}[\d=+/!@#$%^&*]/u;
+var PRICE = new RegExp("(?<!\\d)\\d{1,3}(?:[\\u2000-\\u200a\\u202f\\u205f]\\d{3}){1,6}(?=[\\s\\u2000-\\u200a]{0,2}\\p{Sc})", "gu");
+var LETTERS = new RegExp("[\\u1100-\\u11ff]+|[\\uac00-\\ud7a3][\\u11a8-\\u11ff]*|[\\u30a1-\\u30fa\\uff66-\\uff9d][\\uff9e\\uff9f]|\\P{M}\\p{M}{0,30}|\\p{M}{1,30}", "gu");
 var VALUE_AFTER_TO = (() => {
   const word = String.raw`(?=\S)(?:(?!(?:${NOT_A_VALUE.join("|")})[.,;:!?)\]"'”’…—]*(?!\S))|(?=${SECRETY}))`;
   return String.raw`(?=:\s*${word}|(?!:)${word}|${SECRETY})`;
@@ -304,7 +348,7 @@ var RULES = [
   // An extension right after a phone that was just taken out: "[phone 1] x23".
   [/(?<=\]\s?)(?:x|ext\.?)\s?\d{1,5}\b/gi, "phone"]
 ];
-function scrubber(known = []) {
+function scrubber(known = [], { remember = false, additions = true } = {}) {
   const toReal = /* @__PURE__ */ new Map();
   const toMark = /* @__PURE__ */ new Map();
   const counts = { email: 0, phone: 0, number: 0, id: 0, name: 0 };
@@ -317,20 +361,26 @@ function scrubber(known = []) {
     toReal.set(m, real);
     return m;
   };
-  const names = [
-    ...new Set(
-      known.map((n) => n.replace(/\u00a0/g, " ").trim()).filter((n) => n.length >= 2 && !/^\d+$/.test(n)).flatMap((n) => n.includes("@") ? [n] : [n, ...n.split(/[\s_+'’-]+/).filter((p) => p.length >= 3)])
-    )
-  ].sort((a, b) => b.length - a.length);
-  const nameRe = names.length ? new RegExp(
-    `(?<![\\p{L}\\p{N}@._+-])(?<!\\[)(?:${names.map(quote).join("|")})(?:'?s)?(?![\\p{L}\\p{N}@]|[._+-][\\p{L}\\p{N}@]|\\s\\d+\\])`,
-    "giu"
-  ) : null;
   const normalise = (s) => s.replace(new RegExp("\\p{Cf}", "gu"), "").replace(/\u00a0/g, " ").replace(/[\uff20\ufe6b]/g, "@").replace(/%40/gi, "@").replace(/&#64;|&commat;/gi, "@").replace(/[\uff10-\uff19]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 65296 + 48)).replace(/[\u0660-\u0669]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 1632 + 48)).replace(/[\u06f0-\u06f9]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 1776 + 48)).replace(/[\u0966-\u096f]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 2406 + 48)).replace(new RegExp("\\b(\\p{Lu})\\.(\\p{Lu}\\p{Ll}+)", "gu"), "$1. $2");
-  const handles = new Set(known.map((n) => n.trim().toLowerCase()).filter((n) => !/\s/.test(n)));
-  const parts = new Set(
-    names.map((n) => n.includes("@") ? n.slice(0, n.lastIndexOf("@")) : n).flatMap((n) => n.toLowerCase().split(/[\s._+'’-]+/)).filter((p) => p.length >= 3)
-  );
+  const people = (known2) => {
+    const names = [
+      ...new Set(
+        known2.map((n) => n.replace(/\u00a0/g, " ").trim()).filter((n) => n.length >= 2 && !/^\d+$/.test(n)).flatMap(
+          (n) => n.includes("@") ? [n] : [n, ...n.split(/[\s_+'’-]+/).filter((p) => p.length >= 3)]
+        )
+      )
+    ].sort((a, b) => b.length - a.length);
+    const nameRe = names.length ? new RegExp(
+      `(?<![\\p{L}\\p{N}@._+-])(?<!\\[)(?:${names.map(quote).join("|")})(?:'?s)?(?![\\p{L}\\p{N}@]|[._+-][\\p{L}\\p{N}@]|\\s\\d+\\])`,
+      "giu"
+    ) : null;
+    const handles = new Set(known2.map((n) => n.trim().toLowerCase()).filter((n) => !/\s/.test(n)));
+    const parts = new Set(
+      names.map((n) => n.includes("@") ? n.slice(0, n.lastIndexOf("@")) : n).flatMap((n) => n.toLowerCase().split(/[\s._+'’-]+/)).filter((p) => p.length >= 3)
+    );
+    return { nameRe, handles, parts };
+  };
+  const given = people(known);
   const all = (re, t, kind, rank, out) => {
     if ("again" in re) return chained(re, t, kind, rank, out);
     if (!(re instanceof RegExp)) return after(re, t, kind, rank, out);
@@ -338,7 +388,40 @@ function scrubber(known = []) {
       if (m[0]) out.push({ s: m.index ?? 0, e: (m.index ?? 0) + m[0].length, kind, rank });
     return out;
   };
-  const segments = (p, at, inText, out) => {
+  const folded = (t) => {
+    let text2 = "";
+    const from = [];
+    const to = [];
+    const prices = [...t.matchAll(PRICE)].map((m) => [m.index ?? 0, (m.index ?? 0) + m[0].length]);
+    let p = 0;
+    const priced = (at) => {
+      while (p < prices.length && at >= (prices[p]?.[1] ?? 0)) p++;
+      return at >= (prices[p]?.[0] ?? Number.POSITIVE_INFINITY);
+    };
+    for (const m of t.matchAll(LETTERS)) {
+      const f = priced(m.index ?? 0) || /[…ªº№\p{No}\u02b0-\u02ff\u1d2c-\u1d6a\u2070-\u209f]/u.test(m[0]) ? m[0] : m[0].normalize("NFKC");
+      for (let k = 0; k < f.length; k++) {
+        from.push(m.index ?? 0);
+        to.push((m.index ?? 0) + m[0].length);
+      }
+      text2 += f;
+    }
+    return { text: text2, from, to };
+  };
+  const foldedKnown = known.map((n) => n.normalize("NFKC"));
+  const alike = known.every((n, i) => n === foldedKnown[i]);
+  const other = alike ? given : people(foldedKnown);
+  const both = (t, read) => {
+    const spans = read(t, given, false);
+    if (!additions) return spans;
+    if (alike && /^[\x00-\x7f]*$/.test(t)) return spans;
+    const f = folded(t);
+    if (alike && f.text === t && !new RegExp("\\p{M}", "u").test(t)) return spans;
+    for (const x of read(f.text, other, true))
+      spans.push({ ...x, s: f.from[x.s] ?? 0, e: f.to[x.e - 1] ?? t.length });
+    return spans;
+  };
+  const segments = (p, at, inText2, out) => {
     let afterPersonal = false;
     const segs = p.split("/");
     const host = /^[a-z][a-z0-9+.-]*:$/i.test(segs[0] ?? "") && segs[1] === "" ? 2 : -1;
@@ -353,7 +436,7 @@ function scrubber(known = []) {
       }
       const personal = afterPersonal;
       const word = seg.split(";")[0]?.toLowerCase() ?? "";
-      afterPersonal = PERSONAL.has(word) || inText && word === "home";
+      afterPersonal = PERSONAL.has(word) || inText2 && word === "home";
       const version = !personal && /^v\d{1,2}$/.test(seg);
       const record = !version && (personal || seg.startsWith("@") || /^\d+$/.test(seg) || /^[0-9a-f-]{8,}$/i.test(seg) || /\d/.test(seg) && new RegExp("\\p{L}", "u").test(seg) || new RegExp("[-\\d~;_+?=&[\\]\\p{Lu}]|\\P{ASCII}", "u").test(seg) || // A dot names a record ("jane.doe") unless it is the host or a file ("payload.sh", "index.html").
       seg.includes(".") && i !== host && !FILE.test(seg));
@@ -391,9 +474,10 @@ function scrubber(known = []) {
   };
   const HOMES = [/(?<=\b[a-z]:[\\/]users[\\/])[^\\/"'\n]+/gi, /(?<=[\\/](?:home|users)[\\/])[^/\\\s"')]+/gi];
   const JOINED = /(?<![\p{L}\p{N}])(@?)([\p{L}\p{N}]+(?:[-_.+@:][\p{L}\p{N}]+)+)/gu;
-  const joined = (t, out) => {
+  const JOINED_MARKED = /(?<![\p{L}\p{M}\p{N}])(@?)([\p{L}\p{M}\p{N}]+(?:[-_.+@:][\p{L}\p{M}\p{N}]+)+)/gu;
+  const joined = (t, out, { parts, handles }, marked) => {
     if (!parts.size) return out;
-    for (const m of t.matchAll(JOINED)) {
+    for (const m of t.matchAll(marked ? JOINED_MARKED : JOINED)) {
       const [, at = "", w = ""] = m;
       if (at && handles.has(w.toLowerCase())) continue;
       if (!w.toLowerCase().split(/[-_.+@:]/).some((p) => parts.has(p)))
@@ -432,37 +516,87 @@ function scrubber(known = []) {
     return out + t.slice(pos);
   };
   const LAST = 1e4;
-  const values = (t) => {
+  const kept = /* @__PURE__ */ new Set();
+  const reOf = (secrets) => new RegExp(
+    `(?<![\\p{L}\\p{N}])(?:${[...secrets].sort((a, b) => b.length - a.length).map(quote).join("|")})(?![\\p{L}\\p{N}])`,
+    "giu"
+  );
+  const SETTING = /\b(?<n>[A-Za-z0-9_]+)\\*["'`]?\s*(?<is>=>|:=|[=:])(?<space>\s*)\$?\\*(?<q>["'`]?)$/;
+  const again = (t, out) => {
+    const here = /* @__PURE__ */ new Set();
+    for (const x of out) {
+      if (x.rank < 200 || x.rank >= 300 || x.e - x.s > 220) continue;
+      const {
+        n = "",
+        is = "",
+        space = "",
+        q = ""
+      } = SETTING.exec(t.slice(Math.max(0, x.s - 80), x.s))?.groups ?? {};
+      const setting = is !== "" && (is !== ":" || q !== "" || space === "");
+      const said = t.slice(x.s, x.e).replace(/^[\s"'‘‚‹“„«`*(<[:=]+/u, "").replace(/[\s"'’‘›”“»`*)>\].,:;!?…]+$/u, "");
+      const whole = setting ? said : said.replace(/^now(?:\s*:\s*|\s+|(?=["'‘‚‹“„«`*(<[]))["'‘‚‹“„«`*(<[]*(?=\S{4})/iu, "");
+      const prose = is === ":" && !setting;
+      if (prose && (/^(?:\/[a-z-]+|\/?[a-z-]+(?:\/(?:[a-z-]+|v\d{1,2}))+)$/.test(whole) || new RegExp("^\\p{Lu}?\\p{Ll}{1,12}\\/\\p{Lu}?\\p{Ll}{1,12}$", "u").test(whole)))
+        continue;
+      if (/^(?:undefined|null|true|false|none)$/i.test(whole)) continue;
+      const named = setting && !NOT_A_VALUE.includes(whole.toLowerCase()) && (/^[A-Z][A-Z0-9_]*$/.test(n) || /\S\s+\S/.test(whole) && !/^key$/i.test(n));
+      for (const v of [whole, ...whole.split(/[,;]/)]) {
+        const core = v.replace(/^[^\p{L}\p{N}]+/u, "").replace(/[^\p{L}\p{N}]+$/u, "");
+        if (core.length < 4) continue;
+        const secret = REPEATED.test(v);
+        if ((secret || v === whole && named) && here.size < 50) here.add(core);
+        if (secret && remember && kept.size < 50) kept.add(core);
+      }
+    }
+    for (const x of kept) here.add(x);
+    if (here.size) all(reOf(here), t, "id", LAST + PERSON.length, out);
+  };
+  const values = (t, who = given, marked = false) => {
     const out = [];
     RULES.forEach(([re, kind, first], i) => {
       if (first) all(re, t, kind, 1 + i, out);
     });
-    if (nameRe) all(nameRe, t, "name", 100, out);
+    if (who.nameRe) all(who.nameRe, t, "name", 100, out);
     CREDENTIALS.forEach(([re, kind], i) => {
       all(re, t, kind, 200 + i, out);
     });
+    if (additions) {
+      again(t, out);
+      for (const x of loosePayment(t)) out.push({ ...x, kind: "number", rank: LAST });
+    }
     RULES.forEach(([re, kind, first], i) => {
       if (!first) all(re, t, kind, 300 + i, out);
     });
     PERSON.forEach(([re, kind], i) => {
       all(re, t, kind, LAST + i, out);
     });
-    return joined(t, out);
+    return joined(t, out, who, marked);
   };
-  const text = (s) => {
-    const t = normalise(s);
-    const spans = values(t);
+  const inText = (t, who, marked) => {
+    const spans = values(t, who, marked);
     for (const { at, url } of urls(t)) {
       const u = /^(https?:\/\/[^/?#]+)([/?#].*)?$/i.exec(url);
       if (u?.[2]) segments(u[2], at + (u[1]?.length ?? 0), false, spans);
     }
     for (const m of t.matchAll(PATHLIKE)) segments(m[0], m.index ?? 0, true, spans);
     for (const re of HOMES) all(re, t, "name", LAST, spans);
-    return scrub(t, spans);
+    return spans;
+  };
+  const text = (s) => {
+    const t = normalise(s);
+    return scrub(t, both(t, inText));
   };
   const path = (p) => {
     const t = normalise(p);
-    return scrub(t, segments(t, 0, false, values(t)));
+    return scrub(
+      t,
+      both(t, (x, who, marked) => segments(x, 0, false, values(x, who, marked)))
+    );
+  };
+  const holds = (s) => {
+    if (!kept.size) return false;
+    const t = normalise(s);
+    return [t, folded(t).text].some((x) => reOf(kept).test(x));
   };
   const restore = (s) => s.replace(PLACEHOLDER, (m, kind, n) => toReal.get(canon(kind, n)) ?? m);
   const plain = (s) => s.replace(PLACEHOLDER, (_, kind) => canon(kind));
@@ -482,7 +616,19 @@ function scrubber(known = []) {
     ...r.build ? { build: clean(r.build) } : {},
     trail: cleanTrail(r.trail)
   });
-  return { text, path, restore, plain, words, clean, cleanPath, cleanTrail, cleanReport };
+  return {
+    text,
+    path,
+    restore,
+    plain,
+    words,
+    clean,
+    cleanPath,
+    cleanTrail,
+    cleanReport,
+    holds,
+    forget: () => kept.clear()
+  };
 }
 var WORDS = {
   email: "an email address",
