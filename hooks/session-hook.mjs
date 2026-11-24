@@ -357,7 +357,12 @@ export function noteText(note, { short, worktree, host, signed, prompts }) {
     ...(note.kind === 'approved'
       ? [
           '',
-          `${note.paired ? 'The founder' : from} approved the plan this session asked about in Merle. It merges and deploys nothing.`,
+          `${note.paired ? 'The founder' : from} approved ${
+            // By its ask's id; an approval from before they named one says no plan.
+            /\(k-[a-z]{10}\)/.test(String(note.text))
+              ? 'that plan, the one Merle names above, and no other'
+              : 'the plan this session asked about in Merle'
+          }. It merges and deploys nothing.`,
         ]
       : []),
     ...(refs.length
