@@ -852,7 +852,7 @@ async function hook(what, short) {
  */
 /**
  * Off needs the passkey this Mac pinned: Merle asks the person who paired it to sign "signing-off" with Touch ID on its
- * Sessions page, and this Mac checks the signature itself, as it checks a job or a note (signedBy).
+ * Agents page, and this Mac checks the signature itself, as it checks a job or a note (signedBy).
  */
 async function passkeySaysOff(pin) {
   return passkeySays(pin, 'signing-off', (path, init, ms) => api(pin, path, init, ms), noteNonces);

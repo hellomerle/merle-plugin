@@ -240,7 +240,19 @@ export function stopRefusal(stop, a, pin, { now, mine, requireSigned, seen }) {
 }
 
 /** Which kinds of thing a passkey signs here. Each says what it is in the challenge, so one never passes as another. */
-const DOMAINS = ['job', 'note', 'signing-off', 'stop', 'reading-on'];
+/**
+ * The version of reading's own words: what `reading on` prints here (READING_SAYS) and what Merle's page shows beside
+ * Sign. Raise it with any change to either. It is in what Touch ID signs: the ask names it (`words`) and is signed under
+ * that version's own domain, so a signature counts for the words that were on the screen and for no others. A helper's
+ * name or task leaves only under it. An on signed before it (the plain "reading-on" domain) goes on for reading, what is
+ * typed and the agent's own words, and for no helper's name or task: which words were beside it can't be told.
+ */
+export const READING_WORDS = 3;
+/** Each version this copy knows, and the domain its ask is signed under. */
+export const READING_DOMAINS = new Map([[3, 'reading-on-3']]);
+const DOMAINS = ['job', 'note', 'signing-off', 'stop', 'reading-on', ...READING_DOMAINS.values()];
+/** The domain a reading-on ask is signed under: its words' own; the plain one when it names none; null when unknown here. */
+const readingDomain = (o) => (o?.words === undefined ? 'reading-on' : (READING_DOMAINS.get(o.words) ?? null));
 /** The WebAuthn challenge for a job or a note: SHA-256 of "merle-<domain>", a zero byte, then its exact bytes. */
 export const challengeOf = (domain, bytes) => sha256(`merle-${domain}\0${bytes}`).toString('base64url');
 /**
@@ -283,33 +295,55 @@ export function signedBy(domain, bytes, a, pin) {
  * (signedBy, with the ask's own domain, so one kind never passes for another) and takes its nonce once. `ask` calls
  * Merle with this Mac's token. Returns the ask's bytes and the assertion, or null.
  */
-export async function passkeySays(pin, kind, ask, nonces, say = console.log, exit = process.exit) {
+export async function passkeySays(
+  pin,
+  kind,
+  ask,
+  nonces,
+  say = console.log,
+  exit = process.exit,
+  /** The ask the on it is signed again over was kept under: it stays the one reading is on under. */
+  over = null,
+) {
   let made;
   try {
-    made = await ask('/v1/runner/hook/signing-off', { method: 'POST', body: JSON.stringify({ kind }) });
+    // With the version of the words this Mac just printed, so the ask names no newer ones.
+    made = await ask('/v1/runner/hook/signing-off', {
+      method: 'POST',
+      body: JSON.stringify({
+        kind,
+        ...(kind === 'reading-on' ? { words: READING_WORDS, ...(over ? { over } : {}) } : {}),
+      }),
+    });
   } catch (err) {
-    say(
-      typeof err?.shown === 'string' ? err.shown : 'Merle didn’t answer. Try again when this Mac is online.',
-    );
+    say(typeof err?.shown === 'string' ? err.shown : NO_ANSWER);
     return null;
   }
-  let o;
-  try {
-    o = JSON.parse(made.canonical);
-  } catch {
-    return null;
-  }
-  const now = Date.now();
-  if (o?.type !== kind || o.runner !== pin.runner || o.id !== made.id || !(o.expires > now)) return null;
-  stopped = false;
-  // Given up on here (an error, a bad signature, ten minutes, Ctrl-C, the terminal closed or the process told to stop):
-  // Merle drops the ask, so nobody signs it later for a change this Mac never made (the third and fourth reads). Once
-  // stopped, nothing it hears after counts: the assertion is never returned.
+  // Given up on here (an ask it won't take, an error, a bad signature, ten minutes, Ctrl-C, the terminal closed or the
+  // process told to stop): Merle drops the ask, so nobody signs it later for a change this Mac never made (the third and
+  // fourth reads). Once stopped, nothing it hears after counts: the assertion is never returned.
   const drop = () =>
-    ask(`/v1/runner/hook/signing-off/${encodeURIComponent(made.id)}/drop`, {
+    ask(`/v1/runner/hook/signing-off/${encodeURIComponent(made?.id)}/drop`, {
       method: 'POST',
       body: '{}',
     }).catch(() => {});
+  let o;
+  try {
+    o = JSON.parse(made.canonical);
+  } catch {}
+  const now = Date.now();
+  if (o?.type !== kind || o.runner !== pin.runner || o.id !== made.id || !(o.expires > now)) {
+    await drop();
+    return null;
+  }
+  // The very words just printed here, or nothing is signed for them.
+  if (kind === 'reading-on' && (o.words !== READING_WORDS || (o.over ?? null) !== over)) {
+    say('Merle’s ask names other words than these, so nothing was signed. Try again in a few minutes.');
+    await drop();
+    return null;
+  }
+  const domain = kind === 'reading-on' ? readingDomain(o) : kind;
+  stopped = false;
   const stop = () => {
     stopped = true;
     void drop().finally(() => exit(130));
@@ -318,39 +352,56 @@ export async function passkeySays(pin, kind, ask, nonces, say = console.log, exi
   for (const s of signals) process.once(s, stop);
   try {
     say(
-      'Confirm it on Merle’s Sessions page, signed in as the person who paired this Mac, with Touch ID. Waiting up to 10 minutes…',
+      'Confirm it on Merle’s Agents page, signed in as the person who paired this Mac, with Touch ID. Waiting up to 10 minutes…',
     );
     while (Date.now() < o.expires && !stopped) {
       let got;
       try {
         got = await ask(`/v1/runner/hook/signing-off/${encodeURIComponent(made.id)}?wait=25`, {}, 40_000);
-      } catch {
+      } catch (err) {
+        // Run out while it waited, or Merle stopped answering: said, and dropped either way.
+        say(Date.now() >= o.expires ? RAN_OUT : typeof err?.shown === 'string' ? err.shown : NO_ANSWER);
         await drop();
         return null;
       }
       if (stopped) return null;
       if (!got.assertion) continue;
-      const why = signedBy(kind, made.canonical, got.assertion, pin);
+      const why = signedBy(domain, made.canonical, got.assertion, pin);
       if (why) {
         say(`That signature didn’t pass on this Mac (${why}).`);
         await drop();
         return null;
       }
+      let fresh = false;
       try {
-        if (typeof o.nonce !== 'string' || !nonces.take(o.nonce, o.expires, Date.now())) return null;
-      } catch {
+        fresh = typeof o.nonce === 'string' && nonces.take(o.nonce, o.expires, Date.now());
+      } catch {}
+      if (!fresh) {
+        await drop();
         return null;
       }
       return stopped ? null : { canonical: made.canonical, assertion: got.assertion };
     }
     if (stopped) return null;
-    say('Nobody confirmed it in 10 minutes.');
+    say(RAN_OUT);
     await drop();
     return null;
   } finally {
     for (const s of signals) process.removeListener(s, stop);
   }
 }
+const NO_ANSWER = 'Merle didn’t answer. Try again when this Mac is online.';
+const RAN_OUT = 'Nobody signed it in 10 minutes. Run this again.';
+/** A refusal from Merle in words for the terminal: its own line where it has one that says something. */
+const refusedAs = (status, error) => {
+  const own = typeof error === 'string' ? printable(error).slice(0, 200) : '';
+  if (status === 404)
+    return 'That ask is gone: it ran out, or another terminal on this Mac asked after it. Run this again.';
+  if (status === 429) return 'Asked too many times this hour. Try again later.';
+  if (status >= 500) return 'Merle had a problem. Try again in a few minutes.';
+  if (status === 400) return 'Merle doesn’t take this yet. Try again in a few minutes.';
+  return own || undefined;
+};
 /** Set once a person stopped a wait for their passkey (Ctrl-C and the like): nothing turns on after it. */
 let stopped = false;
 
@@ -442,40 +493,83 @@ export function readingOn(pin = kept()) {
  * ask put back can't turn it on again.
  */
 export function readingSince(pin = kept()) {
-  const r = readingFile();
-  const on = r.on;
-  if (!pin || !on || typeof on.canonical !== 'string') return null;
-  let o;
+  return sinceOf(readingFile(), pin);
+}
+function sinceOf(r, pin, kept_ = r.on) {
+  const o = askIn(kept_);
+  if (!pin || !o) return null;
+  const domain = readingDomain(o);
+  const ok =
+    o.type === 'reading-on' &&
+    o.runner === pin.runner &&
+    Number.isSafeInteger(o.created) &&
+    Number.isSafeInteger(kept_.at) &&
+    !(typeof r.offAt === 'number' && o.created <= r.offAt) &&
+    domain !== null &&
+    signedBy(domain, kept_.canonical, kept_.assertion, pin) === null;
+  return ok ? Math.max(o.created, kept_.at) : null;
+}
+/** The ask an on was signed under, from its signed bytes; null for anything else. */
+function askIn(on) {
   try {
-    o = JSON.parse(on.canonical);
+    const o = JSON.parse(on?.canonical ?? 'null');
+    return o && typeof o === 'object' && !Array.isArray(o) ? o : null;
   } catch {
     return null;
   }
-  const ok =
-    o?.type === 'reading-on' &&
-    o.runner === pin.runner &&
-    Number.isSafeInteger(o.created) &&
-    Number.isSafeInteger(on.at) &&
-    !(typeof r.offAt === 'number' && o.created <= r.offAt) &&
-    signedBy('reading-on', on.canonical, on.assertion, pin) === null;
-  return ok ? Math.max(o.created, on.at) : null;
 }
 /**
- * The version of reading's own words a reading-on must have been signed under for a helper's task to leave (the founder,
- * 23 Nov): Merle puts it in the ask the person signs (`text`), beside those words. One signed before
- * names no version, so its Mac goes on sending names, as it agreed to, and never a task.
+ * Whether this Mac plainly isn't reading, for telling Merle off on its own: 'off' only with no on on file, or one that is
+ * surely none (another runner's, from before the last off, or a signature that doesn't check under a domain known here).
+ * 'unknown' for what this copy can't judge, so it never turns off what another copy or a person turned on: a file or a
+ * Keychain it can't read, or an ask that names words it doesn't know.
  */
-export const READING_TEXT = 2;
+export function readingState(pin = kept()) {
+  let r;
+  try {
+    r = JSON.parse(readFileSync(READING, 'utf8'));
+  } catch (err) {
+    return err?.code === 'ENOENT' ? 'off' : 'unknown';
+  }
+  return !r || typeof r !== 'object' || Array.isArray(r) ? 'unknown' : stateOf(r, pin);
+}
+function stateOf(r, pin) {
+  if (r.on === null || r.on === undefined) return 'off';
+  const o = askIn(r.on);
+  if (!pin || !o) return 'unknown';
+  if (sinceOf(r, pin) !== null) return 'on';
+  if (o.type !== 'reading-on' || o.runner !== pin.runner) return 'off';
+  if (typeof r.offAt === 'number' && o.created <= r.offAt) return 'off';
+  return readingDomain(o) === null ? 'unknown' : 'off';
+}
+/** What `reading on` prints before the person types on. */
+export const READING_SAYS =
+  'With reading on, at the end of each turn of a Claude Code session in an allowed folder, this Mac sends Merle what you typed (long pastes and anything holding code as their length) and the agent’s own words, questions, plans and to-dos (the code they quote left out), and each tool’s name, scrubbed here and again in Merle and summed up there. As each helper starts, it also sends that helper’s name and the one-line task its Agent call gave it (never that call’s prompt) with the session’s events, and a teammate’s name again when it goes idle. Never any other tool’s input or output, a file’s contents, or the agent’s thinking. Merle keeps the summary and the helpers’ names and tasks, shown to you alone, and they go when reading goes off.';
 /** How long Merle may read this Mac before a look that finds it off here tells Merle off: past any `reading on` write. */
 const READ_ON_GRACE_MS = 120_000;
-/** Whether this Mac's reading-on was signed under words that name helpers' tasks. */
-export function readingTasks(pin = kept()) {
-  if (readingSince(pin) === null) return false;
-  try {
-    return JSON.parse(readingFile().on.canonical).text >= READING_TEXT;
-  } catch {
-    return false;
+/**
+ * Since when helpers' names and tasks may leave: while reading is on, from the ask signed beside words that name them
+ * (READING_WORDS), or null. That ask is the on itself, or the one signed again over an on from before (`helpers`): the
+ * plain on stays as it was, so a copy of the runner or the plugin that doesn't know these words goes on reading. Both are
+ * judged from one reading of the file, so an off or an on between two reads never mixes them. The second counts only where
+ * it says it was signed over that very on (`over`): one left beside another says nothing.
+ */
+export function helpersSince(pin = kept()) {
+  return helpersOf(readingFile(), pin);
+}
+function helpersOf(r, pin) {
+  const on = sinceOf(r, pin);
+  if (on === null) return null;
+  for (const k of [r.on, r.helpers]) {
+    if (k === r.helpers && askIn(k)?.over !== askOf(r.on)) continue;
+    const since = askIn(k)?.words === READING_WORDS ? sinceOf(r, pin, k) : null;
+    if (since !== null) return Math.max(on, since);
   }
+  return null;
+}
+/** Whether helpers' names and tasks may leave this Mac. */
+export function readingHelpers(pin = kept()) {
+  return helpersSince(pin) !== null;
 }
 /** Whether a folder is left out of reading (`reading on --except <folder>`): it, or anything under it. */
 export function readingLeftOut(cwd) {
@@ -543,7 +637,14 @@ async function reading(what, arg, flags, answer = ask) {
     } catch {}
     // Off here at once, whatever Merle says; Merle is told now, and again with each turn until it hears (tellOff).
     // Which on this turns off (the ask it was signed under), so a late off from another hook can't turn a newer on off.
-    updateReading((now) => ({ ...now, on: null, offAt: Date.now(), offTold: false, offFrom: askOf(now.on) }));
+    updateReading((now) => ({
+      ...now,
+      on: null,
+      helpers: null,
+      offAt: Date.now(),
+      offTold: false,
+      offFrom: askOf(now.on),
+    }));
     // The Agent calls held for helpers' tasks go too (hooks/event.mjs holdCall).
     rmSync(join(HOME, 'pending'), { recursive: true, force: true });
     const told = await tellOff();
@@ -590,15 +691,72 @@ async function reading(what, arg, flags, answer = ask) {
     console.log(`Sessions in ${left} aren’t read.`);
     return 0;
   }
-  // On under words signed before helpers' tasks were named: asked again, so the person signs the words that name them.
-  const again = readingOn() && !readingTasks();
-  if (readingOn() && !again) {
-    console.log('Reading is on already.');
-    return 0;
+  // The copy the LaunchAgent runs is another one: it would judge this on by its own words, and an old one reads a first on
+  // as off and tells Merle so. Nothing is asked until they're the same file; which is newer, this can't tell.
+  const here = fileURLToPath(import.meta.url);
+  if (existsSync(RUNNER_SCRIPT) && !sameFile(here, RUNNER_SCRIPT)) {
+    console.log(
+      `The runner installed on this Mac is another copy than this one. If this one is newer, install it, then run this again: node ${shellWord(here)} install\nIf the installed one is newer, run that one: ${me()} reading on`,
+    );
+    return 1;
   }
   const pin = kept();
   if (!pin?.token) {
     console.log(`This Mac isn’t paired. Pair it first: ${me()} pair`);
+    return 1;
+  }
+  if (!process.stdin.isTTY) {
+    console.log('Turning reading on needs you at the Mac: run it in a terminal yourself.');
+    return 1;
+  }
+  const on = readingOn(pin);
+  // On from before its words were in what's signed: asked again, so the person signs beside the ones that name helpers.
+  const again = on && !readingHelpers(pin);
+  // Whether Merle reads this Mac now, and under which ask: if it doesn't (turned off there, or a rollback), nothing was read
+  // meanwhile, so what is signed now starts afresh, as a first on does. An on kept beside it would keep its old start, and
+  // what was typed while nothing read it would leave. So does one signed over an on that Merle doesn't read it under.
+  const was = readingFile().on;
+  const reads = on ? await merleReads() : null;
+  // Merle takes no reading now (not open, not on the plan), or doesn't know this Mac: said, and nothing is asked or changed.
+  if (reads?.said) {
+    console.log(reads.said);
+    return 1;
+  }
+  const other = again && typeof reads === 'string' && reads !== askOf(was);
+  const lost = on && (reads === false || other);
+  if (on && !again && !lost) {
+    console.log('Reading is on already.');
+    return 0;
+  }
+  if (again && reads === null) {
+    console.log(NO_ANSWER);
+    return 1;
+  }
+  if (other)
+    console.log(
+      'Merle reads this Mac under another signature than the one here. If you go on, Merle is told reading is off first, and deletes what it kept of it. Then sign again, and it reads from then on.',
+    );
+  else if (lost)
+    console.log(
+      'Reading is on here, but Merle isn’t reading this Mac, so nothing is read. Sign again and it is, from then on. What Merle had summed up before it stopped isn’t brought back.',
+    );
+  else if (again)
+    console.log('Sign again on this Mac for your helpers’ names and tasks. Reading itself stays on.');
+  console.log(READING_SAYS);
+  // How reading is when it's said, from the file: an off from another terminal may have landed since.
+  const left = () => {
+    if (on && !readingOn(pin))
+      return 'Reading is off on this Mac: nothing is read. Run this again to turn it on.';
+    return again && !lost && !readingHelpers(pin)
+      ? 'Reading stays on as before, without your helpers’ names and tasks.'
+      : 'Left as it was.';
+  };
+  const said = await answer('Type on to turn reading on: ');
+  // An off from another terminal from here on always wins: nothing is asked or written over it.
+  const offBefore = readingFile().offAt;
+  const unchanged = (now) => now.offAt === offBefore && now.on?.canonical === was?.canonical;
+  if (said !== 'on') {
+    console.log(left());
     return 1;
   }
   // An off Merle hasn't heard yet goes first: told after this on, it would turn Merle off again.
@@ -606,77 +764,126 @@ async function reading(what, arg, flags, answer = ask) {
     console.log('Merle didn’t answer. Try again when this Mac is online.');
     return 1;
   }
-  // And any ask this Mac left unsigned (one it lost track of, killed while it waited) is dropped before a new one.
+  // And any ask this Mac left unsigned (one it lost track of, killed while it waited) is dropped before a new one: only
+  // now, at the Mac and on their word, so a second terminal opened by mistake never takes the first one's ask away.
   await api('/v1/runner/hook/signing-off/drop-unsigned', { method: 'POST', body: '{}' }).catch(() => {});
-  if (!process.stdin.isTTY) {
-    console.log('Turning reading on needs you at the Mac: run it in a terminal yourself.');
-    return 1;
-  }
-  console.log(
-    'With reading on, at the end of each turn of a Claude Code session in an allowed folder, this Mac sends Merle what you typed (long pastes and anything holding code as their length) and the agent’s own words, questions, plans and to-dos (the code they quote left out), and each tool’s name, scrubbed here and again in Merle and summed up there. As each helper starts, it also sends that helper’s name and the one-line task its Agent call gave it (never that call’s prompt) with the session’s events, and a teammate’s name again when it goes idle. Never any other tool’s input or output, a file’s contents, or the agent’s thinking. Merle keeps the summary and the helpers’ names and tasks, shown to you alone, and they go when reading goes off.',
-  );
-  if ((await answer('Type on to turn reading on: ')) !== 'on') {
-    console.log(again ? 'Reading stays on as before, without helpers’ tasks.' : 'Left off.');
-    return 1;
-  }
   // Merle's answer as JSON, or a throw for anything but a 2xx: passkeySays reads a throw as "didn't answer".
   const call = async (path, init = {}, ms = 10_000) => {
     const res = await api(path, { ...init, signal: AbortSignal.timeout(ms) });
     if (!res.ok) {
       const said = await res.json().catch(() => ({}));
-      throw Object.assign(Error(`merle ${res.status}`), {
-        shown: typeof said?.error === 'string' ? printable(said.error).slice(0, 200) : undefined,
-      });
+      throw Object.assign(Error(`merle ${res.status}`), { shown: refusedAs(res.status, said?.error) });
     }
     return res.json();
   };
-  // An off from another terminal while this one waits always wins: nothing is written over it.
-  const offBefore = readingFile().offAt;
-  const signed = await passkeySays(pin, 'reading-on', call, readingNonces);
+  // Asked again, as Merle may have stopped or started reading while the words waited for an answer: what would be signed
+  // over, or afresh, is no longer so.
+  let same = !on || (await merleReads()) === reads;
+  // Merle reads it under another ask: told off first, while the on here still holds, so the runner's next look never finds
+  // Merle reading and this Mac off and drops the ask that waits. That very ask, so a newer on is never turned off.
+  if (same && other && !(await postOff(reads || null))) {
+    console.log(NO_ANSWER);
+    return 1;
+  }
+  // Afresh: the old on goes first, under the lock, so however this ends (refused, run out, killed, the file not written)
+  // Merle's new start never stands beside the old one's. The file must be as it was when the word was typed, either way.
+  if (same)
+    updateReading((now) => {
+      same = unchanged(now);
+      return same && lost ? { ...now, on: null, helpers: null } : now;
+    });
+  if (!same) {
+    console.log(
+      'Reading on this Mac, or whether Merle reads it, changed while you were here, so nothing was asked. Run this again.',
+    );
+    return 1;
+  }
+  // The Agent calls held for helpers' tasks go too, as with an off.
+  if (lost) rmSync(join(HOME, 'pending'), { recursive: true, force: true });
+  const signed = await passkeySays(
+    pin,
+    'reading-on',
+    call,
+    readingNonces,
+    console.log,
+    process.exit,
+    on && !lost ? askOf(was) : null,
+  );
   if (!signed) {
-    console.log(again ? 'Reading stays on as before, without helpers’ tasks.' : 'Left off.');
+    console.log(left());
     return 1;
   }
   try {
-    readingLog({ event: 'on' });
+    readingLog({ event: again && !lost ? 'helpers' : 'on' });
   } catch {
-    console.log('This Mac can’t write its reading log, so reading stays off.');
+    console.log(`This Mac can’t write its reading log. ${left()}`);
     return 1;
   }
   let wrote = false;
+  let offSince = false;
   updateReading((now) => {
-    if (now.offAt !== offBefore) return now;
-    wrote = true;
-    return { ...now, on: { ...signed, at: Date.now() } };
+    offSince = now.offAt !== offBefore;
+    wrote = !offSince && now.on?.canonical === (lost ? undefined : was?.canonical);
+    if (!wrote) return now;
+    const k = { ...signed, at: Date.now() };
+    // Over an on that holds, the new ask is kept beside it: what reads under it (an older copy too) is never disturbed.
+    // Not where Merle wasn't reading: the new signature is the on, and its own start.
+    return !lost && sinceOf(now, pin) !== null ? { ...now, helpers: k } : { ...now, on: k, helpers: null };
   });
   if (!wrote) {
-    console.log('Reading was turned off on this Mac while you signed, so it stays off.');
+    console.log(
+      offSince
+        ? 'Reading was turned off on this Mac while you signed, so it stays off.'
+        : 'Reading was turned on from another terminal while you signed, so that one stands.',
+    );
     return 1;
   }
-  console.log(`Reading is on. ${me()} reading show <session id> prints exactly what was last sent.`);
+  const update =
+    'Update the plugin (claude plugin update merle@merle), then start a new session: one already open keeps the copy it has.';
+  console.log(
+    again && !lost
+      ? `Signed. Reading goes on as it was. Helpers’ names and tasks go from sessions on an up-to-date plugin. ${update}`
+      : `Reading is on. ${me()} reading show <session id> prints exactly what was last sent. A session on an older plugin isn’t read. ${update}`,
+  );
   return 0;
 }
-/** The ask an on was signed under, from its signed words; null for anything else. */
+/** The id of the ask an on was signed under; null for anything else. */
 const askOf = (on) => {
-  try {
-    const id = JSON.parse(on?.canonical ?? 'null')?.id;
-    return typeof id === 'string' && /^so-[a-z]{8}$/.test(id) ? id : null;
-  } catch {
-    return null;
-  }
+  const id = askIn(on)?.id;
+  return typeof id === 'string' && /^so-[a-z]{8}$/.test(id) ? id : null;
 };
+/**
+ * Whether Merle reads this Mac now: the ask it reads it under, or false; Merle's own line (`said`) where it takes no reading
+ * or doesn't know this Mac; null when it can't say (down, or one that doesn't know the question). Its own question,
+ * never a look for jobs: a look hands out a signed stop once, and one asked here would be lost.
+ */
+async function merleReads() {
+  try {
+    const res = await api('/v1/runner/hook/reading-state', { signal: AbortSignal.timeout(10_000) });
+    const got = await res.json();
+    if (res.status === 409) return { said: refusedAs(res.status, got?.error) ?? NO_ANSWER };
+    if (!res.ok || !got || typeof got !== 'object') return null;
+    return Number.isSafeInteger(got.readingFor) ? String(got.readingAsk ?? '') : false;
+  } catch (err) {
+    return typeof err?.shown === 'string' ? { said: err.shown } : null;
+  }
+}
 /** Tells Merle reading is off, if it hasn't heard yet: true once it has. */
 export async function tellOff() {
   const r = readingFile();
   if (r.offTold !== false) return true;
-  const res = await api('/v1/runner/hook/reading-off', {
-    method: 'POST',
-    body: JSON.stringify(typeof r.offFrom === 'string' ? { ask: r.offFrom } : {}),
-    signal: AbortSignal.timeout(5_000),
-  }).catch(() => null);
-  if (!res?.ok) return false;
+  if (!(await postOff(r.offFrom))) return false;
   updateReading((now) => ({ ...now, offTold: true }));
   return true;
+}
+/** Says off to Merle, for the on signed under this ask (none: whatever is on): true once it heard. */
+async function postOff(ask) {
+  const res = await api('/v1/runner/hook/reading-off', {
+    method: 'POST',
+    body: JSON.stringify(typeof ask === 'string' ? { ask } : {}),
+    signal: AbortSignal.timeout(5_000),
+  }).catch(() => null);
+  return !!res?.ok;
 }
 /** What Merle or a file holds, fit for a terminal: lines kept, no other control characters. */
 const printableLines = (x) => {
@@ -865,7 +1072,8 @@ const api = async (path, init = {}) => {
   if (r.status === 401) {
     // Removed in Merle: nobody there can resume a pause any more, so none is left holding a session here.
     if (k?.token) clearPauses();
-    throw Error(`Merle refused this Mac’s token. Pair it again: ${me()} pair`);
+    const shown = `Merle refused this Mac’s token. Pair it again: ${me()} pair`;
+    throw Object.assign(Error(shown), { shown });
   }
   return r;
 };
@@ -1106,25 +1314,31 @@ export function flushEvents(now = Date.now(), force = false) {
           }
         }
         for (const b of batches) {
-          // An agent's name (and a helper's task) leaves only while reading is still on as this batch goes, only one written since it went
-          // on, and only for folders it still reads: an off or a folder left out typed meanwhile wins.
-          const since = readingSince();
-          // A task only under a reading-on signed with the words that name tasks (READING_TEXT).
-          const tasks = readingTasks();
-          for (const v of b.lines)
-            if (v.agent && (v.agent.name !== undefined || v.agent.task !== undefined)) {
-              if (!nameMayLeave(v, wheres.get(v), seen.get(v.session), since)) {
-                delete v.agent.name;
-                delete v.agent.task;
-              } else if (!tasks) delete v.agent.task;
+          // An agent's name (and a helper's task) leaves only while reading is still on as this batch goes, only one written
+          // since it went on, and only for folders it still reads: an off or a folder left out typed meanwhile wins. And only
+          // under a reading-on signed beside the words that name both (READING_WORDS), and only while Merle reads this Mac,
+          // asked with none of them sent, as before reading's own words (reading-hook `ready`).
+          const named = b.lines.filter(
+            (v) => v.agent && (v.agent.name !== undefined || v.agent.task !== undefined),
+          );
+          const reads = named.length > 0 && typeof (await merleReads()) === 'string';
+          const since = reads ? helpersSince() : null;
+          // Each session's record read again, as Merle was asked since: one unhooked meanwhile sends nothing more.
+          const hookedNow = new Map();
+          const events = b.lines.filter((v) => hookedHere(v.session, hookedNow));
+          if (!events.length) continue;
+          for (const v of named)
+            if (!nameMayLeave(v, wheres.get(v), hookedNow.get(v.session), since)) {
+              delete v.agent.name;
+              delete v.agent.task;
             }
           const r = await api('/v1/runner/hook/events', {
             method: 'POST',
-            body: JSON.stringify({ events: b.lines }),
+            body: JSON.stringify({ events }),
           });
           // Too many this hour, or lines Merle refused: what's left of this batch goes, never sent again.
           if (!r.ok && r.status !== 400 && r.status !== 413 && r.status !== 429) return sent;
-          sent += b.lines.length;
+          sent += events.length;
           heard = now;
         }
         rmSync(join(SPOOL, n), { force: true });
@@ -1585,7 +1799,7 @@ export async function once(now = Date.now(), wait = 25) {
   const products = [...new Set(c.repos.map((r) => r.product))].join(',');
   const got = await (
     await api(
-      `/v1/runner/jobs?wait=${wait}&limit=${room}&v=5&products=${encodeURIComponent(products)}${SELF ? `&runner=${SELF}` : ''}`,
+      `/v1/runner/jobs?wait=${wait}&limit=${room}&v=5&products=${encodeURIComponent(products)}&helpers=${readingOn(pin) ? (readingHelpers(pin) ? READING_WORDS : 0) : ''}${SELF ? `&runner=${SELF}` : ''}`,
       {
         // Its wait and a full minute more: Merle marks a stop or a job delivered before it answers, so a look given up
         // too soon could lose one. A reply lost on the way (the connection or the Worker gone) still can, as before.
@@ -1593,17 +1807,22 @@ export async function once(now = Date.now(), wait = 25) {
       },
     )
   ).json();
-  // Merle has read this Mac for over two minutes (by its own clock), under an ask this Mac doesn't hold: Merle hears off
-  // now, so an ask this Mac gave up on and the person signed anyway never keeps it on (the fourth and fifth reads). The
-  // two minutes let a reading on still being written here land first.
-  const holds = readingOn() ? askOf(readingFile().on) : null;
+  // Merle has read this Mac for over two minutes (by its own clock), and this Mac plainly isn't on: Merle hears off now,
+  // so an ask this Mac gave up on and the person signed anyway never keeps it on (the fourth and fifth reads). Never over
+  // an on it can't judge, nor over which ask Merle holds: both were signed by the person. The two minutes
+  // let a reading on still being written here land first.
   if (
     Number.isSafeInteger(got?.readingFor) &&
     got.readingFor > READ_ON_GRACE_MS &&
-    got.readingAsk !== holds
+    readingState(pin) === 'off'
   ) {
-    updateReading((r) => ({ ...r, offTold: false, offFrom: null }));
-    await tellOff();
+    // Looked at again under the lock: a `reading on` that landed since is never told off.
+    let still = false;
+    updateReading((r) => {
+      still = !r.on || stateOf(r, pin) === 'off';
+      return still ? { ...r, offTold: false, offFrom: null } : r;
+    });
+    if (still) await tellOff();
   }
   const jobs = Array.isArray(got?.jobs) ? got.jobs : [];
   const done = [];

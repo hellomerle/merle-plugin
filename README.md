@@ -28,7 +28,14 @@ claude plugin marketplace update merle
 claude plugin update merle@merle
 ```
 
-Then start a new Claude Code session. Merle's Sessions page says "Update Merle on that Mac" when a session's plugin is
+Then start a new Claude Code session: one already open keeps the copy it started with. If Merle asks you to sign again for
+your helpers' names and tasks, run this on that Mac, after updating the runner if Merle says it's behind:
+
+```sh
+node "$HOME/Library/Application Support/Merle/runner/merle-runner.mjs" reading on
+```
+
+Reading itself goes on meanwhile. Merle's Sessions page says "Update Merle on that Mac" when a session's plugin is
 older than the published one.
 
 ## Add the feedback button

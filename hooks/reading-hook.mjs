@@ -9,9 +9,10 @@
  * Merle's own scrubber, caps the send at 8 KB, and sends it with the Mac's token at most once every two minutes per
  * session. Each send is a line in ~/Library/Logs/Merle/reading.jsonl (a hash, bytes and counts, never the words); the
  * words stay in `reading/<session>.last` for `merle-runner reading show`. A send Merle doesn't take waits two minutes
- * and goes again from the same place; one Merle says it doesn't take at all (404) waits an hour.
+ * and goes again from the same place; one Merle says it doesn't take at all (404) is passed over, with every turn of the
+ * hour after it, or until reading is signed afresh.
  *
- * While reading is off, or the folder isn't read, its place in the record moves to the end, so nothing written then
+ * While reading is off, the folder isn't read or the session is unhooked, its place in the record moves to the end, so nothing written then
  * leaves later. It prints nothing: a Stop hook's output can steer the session, and this one never does.
  */
 import { createHash, randomBytes } from 'node:crypto';
@@ -38,7 +39,7 @@ import { allowedSince, api, ready, unhookedHere } from './session-hook.mjs';
 
 /** At most one send per session in this long; a send Merle didn't take waits as long. */
 export const EVERY_MS = 2 * 60_000;
-/** Merle doesn't take reading at all (it answered 404): look again in an hour. */
+/** Merle doesn't take reading at all (it answered 404): look again in an hour, or once reading is signed afresh. */
 const CLOSED_MS = 60 * 60_000;
 /** A turn's new lines are read up to this many bytes at once; the rest waits for the next turn. */
 export const READ_MAX =
@@ -214,7 +215,12 @@ export async function readTurn(input, now = Date.now(), last = false) {
     // The next look waits two minutes after a send or a failure, an hour after Merle said it takes none. A time ahead
     // of now (a clock set back) counts as long past.
     const after = (t, ms) => typeof t === 'number' && t <= now && now - t < ms;
-    if (after(st.closedAt, CLOSED_MS)) return 'wait';
+    // That hour's turns are passed over, as the first was: each one's end moves its place on. A 404 from before reading was
+    // turned on (signed afresh since) says nothing of now.
+    if (after(st.closedAt, CLOSED_MS) && st.closedAt >= since) {
+      save(input.session_id, { ...st, offset: statSync(path).size, head });
+      return 'wait';
+    }
     if (!last && (after(st.sentAt, EVERY_MS) || after(st.failedAt, EVERY_MS))) return 'wait';
     const from =
       Number.isSafeInteger(st.offset) && st.head === head && st.offset <= statSync(path).size ? st.offset : 0;
@@ -242,9 +248,17 @@ export async function readTurn(input, now = Date.now(), last = false) {
     };
     const x = extract(entries, keepIt);
     const dropped = x.dropped + bad + (skipped ? 1 : 0);
+    // As it was when the record was read: the same on, and no folder it read from left out or no longer allowed since.
+    const holds = () =>
+      readingSince(pin) === since &&
+      !readingLeftOut(input.cwd) &&
+      [...folders].every(([f, at]) => at === null || (!readingLeftOut(f) && allowedSince(f) === at));
+    /** Why nothing may leave now; null when it may. Unhooked here counts as Merle's 410, whether or not Merle heard it. */
+    const stays = () => (unhookedHere(input) ? 'gone' : holds() ? null : 'off');
     const send = async (body) => {
-      // Still on, right before it leaves: an off typed meanwhile wins.
-      if (readingSince(pin) === null) return 'off';
+      // Right before each thing leaves: an unhook, an off, a folder left out or a fresh signing typed meanwhile wins.
+      const before = stays();
+      if (before) return before;
       try {
         // Words leave only once Merle says, with no words sent, that it reads this session now: unhooked there, or
         // hooked up again after a gap, it answers 410 and nothing of the session goes (a Codex review).
@@ -255,6 +269,8 @@ export async function readTurn(input, now = Date.now(), last = false) {
             { method: 'POST', body: JSON.stringify({ session: body.session, ready: true }) },
             READ_WAIT_MS,
           );
+        const after = stays();
+        if (after) return after;
         await api(
           pin,
           '/v1/runner/hook/reading',
@@ -263,10 +279,12 @@ export async function readTurn(input, now = Date.now(), last = false) {
         );
         return 'taken';
       } catch (err) {
-        // 404: Merle takes no reading from this Mac (an hour). 400 or 422: it won't take this send as it is (or its
+        // 404: Merle takes no reading from this Mac (an hour), and its place moves to the end: what was written while
+        // nothing read it never leaves once something does. 400 or 422: it won't take this send as it is (or its
         // model can't use it), so the turn is passed over rather than sent forever. 410: Merle doesn't read this session
         // now (unhooked), so its place moves to the end, as when reading is off. Anything else (409, 429, 5xx, no
         // answer): two minutes, same place.
+        if (unhookedHere(input)) return 'gone';
         const code = err?.status;
         return code === 404
           ? 'closed'
@@ -285,7 +303,11 @@ export async function readTurn(input, now = Date.now(), last = false) {
         save(input.session_id, {
           ...st,
           head,
-          ...(got === 'refused' ? { offset: next } : got === 'gone' ? { offset: statSync(path).size } : {}),
+          ...(got === 'refused'
+            ? { offset: next }
+            : got === 'gone' || got === 'closed'
+              ? { offset: statSync(path).size }
+              : {}),
           ...(got === 'closed'
             ? { closedAt: now }
             : got === 'off' || got === 'gone'
@@ -328,7 +350,11 @@ export async function readTurn(input, now = Date.now(), last = false) {
       save(input.session_id, {
         ...st,
         head,
-        ...(got === 'refused' ? { offset: next } : got === 'gone' ? { offset: statSync(path).size } : {}),
+        ...(got === 'refused'
+          ? { offset: next }
+          : got === 'gone' || got === 'closed'
+            ? { offset: statSync(path).size }
+            : {}),
         ...(got === 'closed' ? { closedAt: now } : got === 'off' || got === 'gone' ? {} : { failedAt: now }),
       });
       return got === 'off' || got === 'gone' ? 'off' : 'failed';

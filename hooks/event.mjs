@@ -473,7 +473,7 @@ export function taskFor(session, now) {
 /**
  * The fact for a hook's input, with its agent's name (and, on its start, its task) only while this Mac reads its
  * sessions (`r`, the runner) and only once its line in reading.jsonl is written: a log it can't write, and no words go
- * (as reading does). A task only under a reading-on signed with the words that name tasks (`readingTasks`).
+ * (as reading does), and only under a reading-on signed beside words that name both (`readingHelpers`).
  */
 export function namedFact(input, now, r) {
   // A runner that can't say (it refuses this folder, its Keychain won't read): off, and the call is still held.
@@ -484,19 +484,15 @@ export function namedFact(input, now, r) {
       return false;
     }
   };
-  const names = !!r && asks(() => r.readingOn() && !r.readingLeftOut(input?.cwd));
-  const tasks = names && asks(() => r.readingTasks());
+  // Names and tasks alike, only under a reading-on signed beside words that name them (readingHelpers).
+  const names = !!r && asks(() => r.readingHelpers() && !r.readingLeftOut(input?.cwd));
   const event = input?.hook_event_name;
   // Nothing is held while this Mac doesn't read: a failed call only lets go of one held while it did.
   if (isAgentCall(input) && ((names && event === 'PreToolUse') || event === 'PostToolUseFailure'))
     try {
       const said = input.tool_input?.description;
       if (event === 'PreToolUse' || existsSync(pendingFile(input.session_id)))
-        holdCall(
-          input,
-          now,
-          tasks && event === 'PreToolUse' && typeof said === 'string' ? oneLine(said) : '',
-        );
+        holdCall(input, now, event === 'PreToolUse' && typeof said === 'string' ? oneLine(said) : '');
     } catch {}
   let held = null;
   if (names && event === 'SubagentStart')
@@ -505,11 +501,11 @@ export function namedFact(input, now, r) {
     } catch {}
   // Only a task held since reading last went on here: one captured before an off and on again never goes.
   let since = null;
-  if (held && tasks)
+  if (held)
     try {
-      since = r.readingSince();
+      since = r.helpersSince();
     } catch {}
-  const task = held && tasks && Number.isSafeInteger(since) && held.at >= since ? held.task : '';
+  const task = held && Number.isSafeInteger(since) && held.at >= since ? held.task : '';
   const fact = factOf(input, now, { names, task });
   if (fact?.agent?.name || fact?.agent?.task)
     try {
