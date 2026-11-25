@@ -14,7 +14,23 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const HOME = process.env.MERLE_RUNNER_HOME ?? join(homedir(), 'Library', 'Application Support', 'Merle');
+/**
+ * The runner's folder and logs on this system, as merle-runner.mjs placesOf has them (a test holds them equal): a Mac's
+ * ~/Library, else ~/.local/state/merle (fixed, never $XDG_STATE_HOME). Its own copy, so this hook imports nothing but
+ * Node's own.
+ */
+export function placesOf(platform = process.platform, _env = process.env, home = homedir()) {
+  if (platform === 'darwin')
+    return {
+      home: join(home, 'Library', 'Application Support', 'Merle'),
+      logs: join(home, 'Library', 'Logs', 'Merle'),
+    };
+  return {
+    home: join(home, '.local', 'state', 'merle'),
+    logs: join(home, '.local', 'state', 'merle', 'logs'),
+  };
+}
+const HOME = process.env.MERLE_RUNNER_HOME ?? placesOf().home;
 /**
  * This Mac's own folder only with hellomerle.com: a hook run for any other Merle (a test) with no folder of its own
  * writes nothing (the P0 of 22 Nov; merle-runner.mjs homeRefusal).

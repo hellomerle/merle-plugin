@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-// The Merle runner: takes jobs the founder signed in Merle with a passkey, and starts Claude Code on them on this Mac.
+// The Merle runner: takes jobs the founder signed in Merle with a passkey, and starts Claude Code on them where it runs:
+// a Mac, a Linux computer or server, or a container (docs/runner.md §3).
 //
 // It dials out to Merle and opens no port. It checks every job against the passkey it pinned at pairing, and against the
 // repos and permission modes allowed on this Mac, which only this command changes. It never passes bypassPermissions,
 // and nothing from Merle can answer a permission prompt. A job carries a request's reference, never a task's words: the
 // task is this file's own fixed text. Every job is logged here and in Merle; if the local log can't be written, no work.
 //
-// Commands: install, uninstall, pair, unpair, allow <path> [--mode plan|default|acceptEdits] [--confirm], deny <path>,
+// Commands: install [--container], uninstall, pair [--expect <fingerprint>], unpair, allow <path> [--mode plan|default|acceptEdits] [--confirm], deny <path>,
 // list, pause, resume, status, log, run (what the login item runs), hooks codex|cursor [off] (session hookup for them).
 //
 // It also carries a hooked-up session's pause from Merle to this Mac (docs/sessions.md, Pause): the session's own pause
@@ -17,8 +18,9 @@ import {
   appendFileSync,
   chmodSync,
   closeSync,
-  copyFileSync,
   existsSync,
+  constants as fsc,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -38,8 +40,29 @@ import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 
 export const MERLE = process.env.MERLE_URL ?? 'https://app.hellomerle.com';
-export const HOME =
-  process.env.MERLE_RUNNER_HOME ?? join(homedir(), 'Library', 'Application Support', 'Merle');
+/**
+ * Where it keeps its folder and its logs on this system. A Mac: ~/Library/Application Support/Merle and
+ * ~/Library/Logs/Merle, as always. Anywhere else (Linux, a container): ~/.local/state/merle, XDG's own state folder,
+ * logs inside it. Fixed, never $XDG_STATE_HOME: a systemd service and a session's hooks see different environments,
+ * and a folder that differed between them would leave a pause written where the session's gate never looks. The
+ * plugin's light hooks (pause-gate, after-tool, event) keep their own copies, so they import nothing more;
+ * tests/install/runner.test.ts holds them equal. `_env` stays so every copy takes the same arguments.
+ */
+export function placesOf(platform = process.platform, _env = process.env, home = homedir()) {
+  if (platform === 'darwin')
+    return {
+      home: join(home, 'Library', 'Application Support', 'Merle'),
+      logs: join(home, 'Library', 'Logs', 'Merle'),
+    };
+  return {
+    home: join(home, '.local', 'state', 'merle'),
+    logs: join(home, '.local', 'state', 'merle', 'logs'),
+  };
+}
+/** "this Mac" on a Mac, and "this computer" anywhere else (a server, a container), in what it prints. */
+const HERE = process.platform === 'darwin' ? 'this Mac' : 'this computer';
+const Here = process.platform === 'darwin' ? 'This Mac' : 'This computer';
+export const HOME = process.env.MERLE_RUNNER_HOME ?? placesOf().home;
 const CONFIG = join(HOME, 'runner.json');
 /** Two folders are one when their real paths are, as this Mac's disk compares them (no case on darwin). */
 const same = (a, b) => {
@@ -52,30 +75,53 @@ const same = (a, b) => {
   };
   return real(a) === real(b);
 };
-/** The one Merle this Mac's own folder, its Keychain pairing and its logs are for. */
+/** The one Merle this computer's own folder, its own pairing store and its logs are for. */
 const PROD = 'https://app.hellomerle.com';
-const REAL_HOME = join(homedir(), 'Library', 'Application Support', 'Merle');
-const REAL_LOGS = join(homedir(), 'Library', 'Logs', 'Merle');
+const REAL_HOME = placesOf().home;
+const REAL_LOGS = placesOf().logs;
 /**
  * Why this runner must not touch its folder, its pairing or its log now, or null (a test run reached the founder's
  * real folder, 22 Nov). An allowlist: this Mac's own folder, Keychain and logs only with hellomerle.com.
  * - Loaded for one folder (HOME is fixed when the file loads) while MERLE_RUNNER_HOME now names another.
  * - This Mac's own folder with any other Merle (a test edge, however its address is written).
  * - Another folder writing this Mac's own logs (MERLE_RUNNER_LOG unset).
- * - The Keychain's pairing (MERLE_KEYCHAIN_FILE unset) with another folder or another Merle.
+ * - Its own pairing store (the Keychain, the Secret Service or its own file: MERLE_KEYCHAIN_FILE and
+ *   MERLE_RUNNER_TOKEN_FILE unset) with another folder or another Merle. A file the env names is that env's own.
  */
 export function homeRefusal(env = process.env, keychain = false) {
   const asked = env.MERLE_RUNNER_HOME;
   if (asked !== undefined && !same(asked, HOME)) return 'it was loaded for another folder';
   const prod = MERLE === PROD && (env.MERLE_URL === undefined || env.MERLE_URL === PROD);
   const real = same(HOME, REAL_HOME);
-  if (real && !prod) return 'this Mac’s own folder is for hellomerle.com only';
+  if (real && !prod) return `${HERE}’s own folder is for hellomerle.com only`;
   if (!real && (same(dirname(LOG), REAL_LOGS) || same(dirname(READING_LOG), REAL_LOGS)))
     return 'another folder needs a log of its own';
-  if (keychain && !env.MERLE_KEYCHAIN_FILE && (!real || !prod))
-    return 'the Keychain’s pairing is for this Mac’s own folder only';
+  // A named file inside this computer's own folder, as its links really lead, is its own pairing: hellomerle.com alone.
+  const named = env.MERLE_RUNNER_TOKEN_FILE;
+  if (keychain && named && !prod && inside(named, REAL_HOME))
+    return `the pairing in ${HERE}’s own folder is for hellomerle.com only`;
+  if (keychain && !env.MERLE_KEYCHAIN_FILE && !named && (!real || !prod))
+    return `the pairing in the Keychain, the Secret Service or its own file is for ${HERE}’s own folder only`;
   return null;
 }
+/** A path as its links really lead: the file's own, else its folder's with its name, else as written. */
+const realish = (p) => {
+  try {
+    return realpathSync(p);
+  } catch {
+    try {
+      return join(realpathSync(dirname(resolve(p))), basename(p));
+    } catch {
+      return resolve(p);
+    }
+  }
+};
+/** Whether a path, as its links really lead, is a folder or anything under it. */
+const inside = (p, folder) => {
+  const fold = (x) => (process.platform === 'darwin' ? x.toLowerCase() : x);
+  const r = relative(fold(realish(folder)), fold(realish(p)));
+  return r === '' || (!r.startsWith('..') && !isAbsolute(r));
+};
 /** Throws before the runner reads or writes its folder or its pairing when homeRefusal says no. */
 const guardHome = (keychain = false) => {
   const why = homeRefusal(process.env, keychain);
@@ -87,8 +133,7 @@ const JOBS = join(HOME, 'jobs.json');
 const NONCES = join(HOME, 'nonces.json');
 /** Twelve hours to start, and a few minutes for a clock that runs a little apart. */
 const MARGIN_MS = 5 * 60_000;
-export const LOG =
-  process.env.MERLE_RUNNER_LOG ?? join(homedir(), 'Library', 'Logs', 'Merle', 'runner.jsonl');
+export const LOG = process.env.MERLE_RUNNER_LOG ?? join(REAL_LOGS, 'runner.jsonl');
 const CLAUDE = process.env.MERLE_CLAUDE ?? 'claude';
 const AGENT = 'com.hellomerle.runner';
 /** Twelve hours to start: a job approved before the lid closes still runs when it opens. */
@@ -352,7 +397,7 @@ export async function passkeySays(
   for (const s of signals) process.once(s, stop);
   try {
     say(
-      'Confirm it on Merle’s Agents page, signed in as the person who paired this Mac, with Touch ID. Waiting up to 10 minutes…',
+      `Confirm it on Merle’s Agents page, signed in as the person who paired ${HERE}, with your passkey. Waiting up to 10 minutes…`,
     );
     while (Date.now() < o.expires && !stopped) {
       let got;
@@ -368,7 +413,7 @@ export async function passkeySays(
       if (!got.assertion) continue;
       const why = signedBy(domain, made.canonical, got.assertion, pin);
       if (why) {
-        say(`That signature didn’t pass on this Mac (${why}).`);
+        say(`That signature didn’t pass on ${HERE} (${why}).`);
         await drop();
         return null;
       }
@@ -390,7 +435,7 @@ export async function passkeySays(
     for (const s of signals) process.removeListener(s, stop);
   }
 }
-const NO_ANSWER = 'Merle didn’t answer. Try again when this Mac is online.';
+const NO_ANSWER = `Merle didn’t answer. Try again when ${HERE} is online.`;
 const RAN_OUT = 'Nobody signed it in 10 minutes. Run this again.';
 /** A refusal from Merle in words for the terminal: its own line where it has one that says something. */
 const refusedAs = (status, error) => {
@@ -405,39 +450,277 @@ const refusedAs = (status, error) => {
 /** Set once a person stopped a wait for their passkey (Ctrl-C and the like): nothing turns on after it. */
 let stopped = false;
 
-// --- Keychain: the token and the pinned key, never on disk in the clear. Tests point it at a file instead. ---
+// --- Pairing: the token and the pinned key, never on disk in the clear on a Mac. Tests point it at a file instead. ---
 const KEYCHAIN = 'merle-runner';
-/** What pairing kept in the Keychain: the runner id, its token, the pinned passkey and Merle's origin; or null. */
+/** The stores a pairing may be kept in off a Mac, as runner.json records the one it paired with (never a secret). */
+const SECRETS = ['secret-service', 'file'];
+/** Whether a command is on PATH: only to pick a store or a service, never to run what it finds here. */
+const onPath = (cmd) =>
+  (process.env.PATH ?? '').split(':').some((d) => {
+    try {
+      return !!d && statSync(join(d, cmd)).isFile();
+    } catch {
+      return false;
+    }
+  });
+/**
+ * Where the pairing is kept (docs/runner.md §1). A file the env names wins anywhere: MERLE_KEYCHAIN_FILE for tests, and
+ * MERLE_RUNNER_TOKEN_FILE for a mounted secret (a container's). Else a Mac's Keychain. Else, off a Mac, the store it
+ * paired with (`cfg.secrets`); before pairing, the person's MERLE_RUNNER_SECRETS, or the Linux Secret Service where
+ * there is one to talk to (its `secret-tool` and a session bus), or a 0600 file in its own folder.
+ */
+export function storeOf(platform = process.platform, env = process.env, cfg = {}, home = HOME, has = onPath) {
+  if (env.MERLE_KEYCHAIN_FILE) return { kind: 'test', path: env.MERLE_KEYCHAIN_FILE };
+  if (env.MERLE_RUNNER_TOKEN_FILE) return { kind: 'file', path: env.MERLE_RUNNER_TOKEN_FILE, mounted: true };
+  if (platform === 'darwin') return { kind: 'keychain' };
+  const chosen = SECRETS.includes(cfg?.secrets)
+    ? cfg.secrets
+    : SECRETS.includes(env.MERLE_RUNNER_SECRETS)
+      ? env.MERLE_RUNNER_SECRETS
+      : has('secret-tool') && env.DBUS_SESSION_BUS_ADDRESS
+        ? 'secret-service'
+        : 'file';
+  return chosen === 'secret-service'
+    ? { kind: 'secret-service' }
+    : { kind: 'file', path: join(home, 'pairing.json') };
+}
+const SECRET_TOOL = ['service', KEYCHAIN, 'account', 'runner'];
+/**
+ * The pairing file's text, or null when there is none; never read when someone else could read the token or swap the
+ * key. Checked on the file it opened (fstat), so a name swapped between the look and the read changes nothing. Its own
+ * file: this user's, open to nobody else (600 or 400). A mounted one (a container's secret, often root's, and through a
+ * link as Kubernetes mounts it): nobody but its owner may write it, and nobody outside its group may read it.
+ */
+export const readPrivate = (
+  path,
+  mounted,
+  uid = typeof process.getuid === 'function' ? process.getuid() : null,
+) => {
+  let fd;
+  try {
+    // Never waits: a pipe or a device where the file should be is refused below, not read.
+    fd = openSync(path, fsc.O_RDONLY | fsc.O_NONBLOCK);
+  } catch (err) {
+    if (err?.code === 'ENOENT') return null;
+    throw err;
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw Error(`${path} isn’t a file, so the runner won’t read it.`);
+    // Its own file: this user's. A mounted one: this user's or root's (a container's secret often is).
+    if (uid !== null && st.uid !== uid && !(mounted && st.uid === 0))
+      throw Error(`${path} belongs to another user, so the runner won’t read it.`);
+    if (mounted ? st.mode & 0o026 : st.mode & 0o077)
+      throw Error(
+        `${path} is open to others (mode ${(st.mode & 0o777).toString(8)}). ${mounted ? 'Make it 400, 440, 600 or 640' : 'Make it 600 or 400 (chmod 600)'}, then run this again.`,
+      );
+    // Nobody else can swap it from a folder above, as it is named or as its links lead.
+    if (mounted) {
+      checkFolder(dirname(resolve(path)), uid);
+      checkFolder(dirname(realpathSync(path)), uid);
+    }
+    return readFileSync(fd, 'utf8');
+  } finally {
+    closeSync(fd);
+  }
+};
+/**
+ * Makes a folder this runner keeps things in private (700), and refuses when it or a folder above it could be changed
+ * by someone else: owned by another user (root aside), or writable by group or others without the sticky bit (as /tmp
+ * has it). Another user who could rename an entry there could put their own script where the service runs this one, or
+ * their own allow-list and nonces beside it.
+ */
+export function privateFolder(path, uid = typeof process.getuid === 'function' ? process.getuid() : null) {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  chmodSync(path, 0o700);
+  checkFolder(path, uid);
+}
+/**
+ * The walk privateFolder makes, with nothing made or changed: every folder above it as written (lstat, so a link in a
+ * folder others can write is refused) and as its links really lead. A folder that isn't there yet has nothing to check. The session hook runs it on entry.
+ */
+export function checkFolder(path, uid = typeof process.getuid === 'function' ? process.getuid() : null) {
+  if (uid === null) return;
+  let real;
+  try {
+    real = realpathSync(path);
+  } catch (err) {
+    if (err?.code === 'ENOENT') return;
+    throw err;
+  }
+  const refuse = (d, st) => {
+    if (st.uid !== uid && st.uid !== 0)
+      throw Error(`${d} belongs to another user, so the runner won’t keep anything under it.`);
+    if (st.mode & 0o022 && !(st.mode & 0o1000))
+      throw Error(
+        `Others can write to ${d}, so the runner won’t keep anything under it. Make it yours alone (chmod go-w), then run this again.`,
+      );
+  };
+  // As written, by lstat: a link in a folder others can write is one they can swap, so that folder is refused too.
+  // A link itself has no mode to read; the folder holding it is checked one step up.
+  for (let d = resolve(path); ; d = dirname(d)) {
+    let st = null;
+    try {
+      st = lstatSync(d);
+    } catch {}
+    if (st && !st.isSymbolicLink()) refuse(d, st);
+    if (dirname(d) === d) break;
+  }
+  // As its links really lead.
+  for (let d = real; ; d = dirname(d)) {
+    refuse(d, statSync(d));
+    if (dirname(d) === d) return;
+  }
+}
+/**
+ * Reads and writes the pairing in one store (`where`, from storeOf). The secret goes to a tool on stdin, never in its
+ * arguments, so it never shows in the process list; base64, so nothing needs quoting. `run` is spawnSync, faked in
+ * tests. A store that won't take it says so, and the pairing is never put somewhere else instead.
+ */
+export function secretStore(where, run = spawnSync) {
+  const decode = (b) => JSON.parse(Buffer.from(String(b).trim(), 'base64').toString('utf8'));
+  if (where.kind === 'keychain')
+    return {
+      // 44 is the Keychain's "not found"; any other failure is an error, never "not paired".
+      read: () => {
+        const r = run('security', ['find-generic-password', '-a', 'runner', '-s', KEYCHAIN, '-w'], {
+          encoding: 'utf8',
+        });
+        if (r.status === 0) return decode(r.stdout);
+        if (r.status === 44) return null;
+        throw Error('Couldn’t read the Keychain. Nothing was done.');
+      },
+      write: (v) => {
+        const d = run('security', ['delete-generic-password', '-a', 'runner', '-s', KEYCHAIN], {});
+        if (d.status !== 0 && d.status !== 44)
+          throw Error('Couldn’t take the pairing out of the Keychain. Run this again.');
+        if (v === null) {
+          if (secretStore(where, run).read() !== null)
+            throw Error('The pairing is still in the Keychain. Run this again.');
+          return;
+        }
+        const secret = Buffer.from(JSON.stringify(v)).toString('base64');
+        const r = run('security', ['-i'], {
+          input: `add-generic-password -a runner -s ${KEYCHAIN} -w ${secret}\n`,
+        });
+        if (r.status !== 0) throw Error('Couldn’t write to the Keychain.');
+      },
+    };
+  if (where.kind === 'secret-service')
+    return {
+      read: () => {
+        // Nothing there: 0 or 1 with nothing said. Anything else (a locked keyring, no bus, too slow) is an error, never
+        // "not paired", so a pairing still kept there is never taken for gone.
+        const r = run('secret-tool', ['lookup', ...SECRET_TOOL], { encoding: 'utf8', timeout: 5000 });
+        const out = String(r.stdout ?? '').trim();
+        if (r.status === 0) return out ? decode(out) : null;
+        if (r.status === 1 && !out && !String(r.stderr ?? '').trim()) return null;
+        throw Error(
+          'Couldn’t read the Secret Service (is a keyring unlocked?). Nothing was done. Where no keyring is unlocked, pair again with MERLE_RUNNER_SECRETS=file.',
+        );
+      },
+      write: (v) => {
+        if (v === null) {
+          const r = run('secret-tool', ['clear', ...SECRET_TOOL], { timeout: 5000 });
+          if (r.status !== 0 || secretStore(where, run).read() !== null)
+            throw Error(
+              'Couldn’t take the pairing out of the Secret Service (is a keyring unlocked?). Run this again.',
+            );
+          return;
+        }
+        const secret = Buffer.from(JSON.stringify(v)).toString('base64');
+        const r = run('secret-tool', ['store', '--label=Merle runner', ...SECRET_TOOL], {
+          input: secret,
+          timeout: 5000,
+        });
+        if (r.status !== 0)
+          throw Error(
+            'Couldn’t write to the Secret Service (is a keyring unlocked?). To keep it in a file of its own instead, pair with MERLE_RUNNER_SECRETS=file.',
+          );
+      },
+    };
+  const path = where.path;
+  // The test file, as it always was: written 0600 (null as null), read as it is.
+  if (where.kind === 'test')
+    return {
+      read: () => {
+        try {
+          return JSON.parse(readFileSync(path, 'utf8'));
+        } catch {
+          return null;
+        }
+      },
+      write: (v) => writeFileSync(path, JSON.stringify(v), { mode: 0o600 }),
+    };
+  return {
+    read: () => {
+      const text = readPrivate(path, where.mounted === true);
+      if (text === null) return null;
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    },
+    write: (v) => {
+      if (v === null) {
+        rmSync(path, { force: true });
+        return;
+      }
+      // Its own folder, private; a mounted file's folder is the mount's.
+      if (!where.mounted) privateFolder(dirname(path));
+      // A new file beside it, then renamed over: a reader sees the old pairing or the new one, never half of one.
+      const tmp = `${path}.${process.pid}.tmp`;
+      // Made new (wx), never through a link someone left at that name.
+      rmSync(tmp, { force: true });
+      writeFileSync(tmp, JSON.stringify(v), { mode: 0o600, flag: 'wx' });
+      chmodSync(tmp, 0o600);
+      renameSync(tmp, path);
+    },
+  };
+}
+/**
+ * What one store holds, read against runner.json's word that this computer is paired (`paired`, the runner's id, never
+ * a secret): a store that gives nothing then (a keyring locked, a file gone) is an error, never "not paired", so nothing
+ * goes on as though the pairing were gone while it is still there. The tests' own file keeps no word.
+ */
+export function readPairing(where, cfg, run = spawnSync) {
+  const v = secretStore(where, run).read();
+  if (v === null && cfg?.paired && where.kind !== 'test')
+    throw Error(
+      `runner.json says ${HERE} is paired, but its store gives nothing. Unlock its keyring, or unpair and pair again: ${me()} unpair`,
+    );
+  return v;
+}
+/** What pairing kept: the runner id, its token, the pinned passkey and Merle's origin; or null. */
 export const kept = () => {
   guardHome(true);
-  if (process.env.MERLE_KEYCHAIN_FILE) {
-    try {
-      return JSON.parse(readFileSync(process.env.MERLE_KEYCHAIN_FILE, 'utf8'));
-    } catch {
-      return null;
-    }
-  }
-  const r = spawnSync('security', ['find-generic-password', '-a', 'runner', '-s', KEYCHAIN, '-w'], {
-    encoding: 'utf8',
-  });
-  return r.status === 0 ? JSON.parse(Buffer.from(r.stdout.trim(), 'base64').toString('utf8')) : null;
+  const c = config();
+  return readPairing(storeOf(process.platform, process.env, c), c);
 };
-/** Writes what pairing keeps (null removes it): the Keychain item, or the test file. */
+/**
+ * Writes what pairing keeps (null removes it), in the store it belongs in. Off a Mac, runner.json records which store
+ * that is (never the secret), so the runner, the hooks and a systemd unit all read the same one.
+ */
 export const keep = (v) => {
   guardHome(true);
-  if (process.env.MERLE_KEYCHAIN_FILE) {
-    writeFileSync(process.env.MERLE_KEYCHAIN_FILE, JSON.stringify(v), { mode: 0o600 });
-    return;
-  }
-  spawnSync('security', ['delete-generic-password', '-a', 'runner', '-s', KEYCHAIN]);
-  if (v === null) return;
-  // Through `security -i` on stdin, so the token never shows in the process list; base64, so nothing needs quoting.
-  const secret = Buffer.from(JSON.stringify(v)).toString('base64');
-  const r = spawnSync('security', ['-i'], {
-    input: `add-generic-password -a runner -s ${KEYCHAIN} -w ${secret}\n`,
-  });
-  if (r.status !== 0) throw Error('Couldn’t write to the Keychain.');
+  // The store it paired with, so an update (requireSigned beside the pin) stays where the pairing is.
+  const where = storeOf(process.platform, process.env, config());
+  secretStore(where).write(v);
+  if (where.kind === 'test') return;
+  // Which store (off a Mac, never a mounted one) and that it is paired: words only, never the secret.
+  const { secrets: _s, paired: _p, ...c } = config();
+  const store_ =
+    where.kind === 'secret-service' || (where.kind === 'file' && !where.mounted) ? where.kind : null;
+  save(v === null ? c : { ...c, ...(store_ ? { secrets: store_ } : {}), paired: v.runner });
 };
+
+/**
+ * A pairing that takes jobs: one that pinned a passkey. A delivery-only pairing (a one-time code a person approves in
+ * Merle, docs/runner.md §1; not built, it waits on the founder's card) would keep no key, and this runner never takes a
+ * job without one: it asks Merle for none and refuses any it is handed.
+ */
+export const takesJobs = (pin) => !!pin?.publicKey && (pin.kind ?? 'passkey') === 'passkey';
 
 // --- Settings: the allow-list, on this Mac only. ---
 /**
@@ -459,10 +742,15 @@ export const hookSettings = () => {
   return { requireSigned: true };
 };
 /**
- * Whether this Mac takes only signed notes and stops. Kept twice: in the settings file and with the pairing in the
- * Keychain, so deleting the file can't turn it off. Either one says on, it's on.
+ * Whether this computer takes only signed notes and stops. Kept twice: in the settings file and with the pairing in its
+ * store, so deleting the file can't turn it off. Either one says on, it's on. A pairing with no pinned passkey (code
+ * pairing, not built) takes only signed ones, so none at all.
  */
-export const signingRequired = () => !!hookSettings().requireSigned || kept()?.requireSigned === true;
+export const signingRequired = () => {
+  if (hookSettings().requireSigned) return true;
+  const k = kept();
+  return k?.requireSigned === true || (!!k && !takesJobs(k));
+};
 
 // --- Session reading (docs/sessions.md, Session reading): off unless the person who paired this Mac turned it on here.
 /** This Mac's reading setting: the signed ask that turned it on, and the folders left out. */
@@ -702,7 +990,7 @@ async function reading(what, arg, flags, answer = ask) {
   }
   const pin = kept();
   if (!pin?.token) {
-    console.log(`This Mac isn’t paired. Pair it first: ${me()} pair`);
+    console.log(`${Here} isn’t paired. Pair it first: ${me()} pair`);
     return 1;
   }
   if (!process.stdin.isTTY) {
@@ -943,7 +1231,7 @@ export const config = () => {
   }
 };
 const save = (c) => {
-  mkdirSync(HOME, { recursive: true });
+  privateFolder(HOME);
   writeFileSync(CONFIG, `${JSON.stringify(c, null, 2)}\n`, { mode: 0o600 });
 };
 
@@ -1549,19 +1837,37 @@ export function remoteOf(path) {
   }
 }
 
+/** One answer from standard input; nothing (end of input, as a service's /dev/null gives) when none comes. */
 const ask = async (q) => {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const a = await rl.question(q);
+  const closed = new Promise((done) => rl.once('close', () => done('')));
+  const a = await Promise.race([rl.question(q).catch(() => ''), closed]);
   rl.close();
-  return a.trim().toLowerCase();
+  return String(a).trim().toLowerCase();
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms)); // honesty: waits between polls of Merle; only Merle moves a stage
 
 /**
- * Pairs this Mac. The fingerprint shown is the one computed here from the key Merle sent, never Merle's own word for
- * it: if Merle's differs, the key isn't the passkey's and nothing is kept. Nothing is kept without `y` either.
+ * A fingerprint as a person copied it from Merle (`--expect`): its 32 hex digits in any case, spaced or dashed or not,
+ * in fingerprintOf's form; null for anything else.
  */
-export async function pair(answer = ask, say = console.log) {
+export const expectedFingerprint = (s) => {
+  if (typeof s !== 'string') return null;
+  const hex = s.replace(/[\s-]/g, '').toUpperCase();
+  return /^[0-9A-F]{32}$/.test(hex) ? hex.match(/.{4}/g).join(' ') : null;
+};
+
+/**
+ * Pairs this computer. The fingerprint shown is the one computed here from the key Merle sent, never Merle's own word
+ * for it: if Merle's differs, the key isn't the passkey's and nothing is kept. Nothing is kept without `y` either, or,
+ * with no terminal to type it in (a server, a container), without `expect`: the fingerprint the person read in Merle for
+ * their passkey, given before anything is asked (`pair --expect <fingerprint>`). Their passkey signs on their own
+ * device, so nothing here needs Touch ID.
+ */
+export async function pair(answer = ask, say = console.log, expect = null) {
+  const want = expect === null || expect === undefined ? null : expectedFingerprint(expect);
+  if (expect !== null && expect !== undefined && !want)
+    throw Error('That isn’t a passkey’s fingerprint: 32 letters and digits, as Merle shows it in fours.');
   const start = await (
     await api('/v1/runner/pair', { method: 'POST', body: JSON.stringify({ name: hostname().slice(0, 80) }) })
   ).json();
@@ -1586,10 +1892,18 @@ export async function pair(answer = ask, say = console.log) {
         'The key Merle sent doesn’t match the fingerprint it gave for it. Not paired. Nothing was kept.',
       );
     say(
-      `\nWorkspace: ${printable(r.workspace).slice(0, 80)}\nThe passkey's fingerprint, computed on this Mac:\n\n    ${mine}\n`,
+      `\nWorkspace: ${printable(r.workspace).slice(0, 80)}\nThe passkey's fingerprint, computed on ${HERE}:\n\n    ${mine}\n`,
     );
-    if ((await answer('Does Merle show the same fingerprint? Type y to pin it: ')) !== 'y') {
-      say('Not paired. Nothing was kept.');
+    if (
+      want
+        ? want !== mine
+        : (await answer('Does Merle show the same fingerprint? Type y to pin it: ')) !== 'y'
+    ) {
+      say(
+        want
+          ? `That isn’t the fingerprint you gave (${want}). Not paired. Nothing was kept.`
+          : 'Not paired. Nothing was kept.',
+      );
       return false;
     }
     const site = new URL(MERLE);
@@ -1601,8 +1915,9 @@ export async function pair(answer = ask, say = console.log) {
       fingerprint: mine,
       origin: site.origin,
       rpId: site.hostname,
+      kind: 'passkey',
     });
-    log({ event: 'paired', runner: start.id, fingerprint: mine });
+    log({ event: 'paired', runner: start.id, fingerprint: mine, ...(want ? { expected: true } : {}) });
     say(`Paired. Allow a repo next: ${me()} allow <folder> --product <product id>`);
     return true;
   }
@@ -1644,6 +1959,10 @@ async function allow(path, flags) {
   ];
   save(c);
   log({ event: 'allowed', path: full, remote, product, mode, confirm });
+  if (confirm && process.platform !== 'darwin')
+    console.log(
+      'Only a Mac can show that dialog, so every run here is refused while --confirm is on: allow it again with --no-confirm.',
+    );
   console.log(
     `Allowed ${remote} at ${full} for ${product}, up to ${mode}. ${
       confirm
@@ -1655,6 +1974,204 @@ async function allow(path, flags) {
 
 /** A run's own worktree: "merle-R-042-3f2a9c01", its ref and the first eight of its job id (checked by JOB_ID). */
 export const worktreeOf = (job) => `merle-${job.ref}-${String(job.id).slice(2, 10)}`;
+
+/**
+ * What in a run's worktree still asks before an edit (the reviews of 25 Nov): every dot path anywhere in it, which
+ * holds agent, editor, git, hook-manager and package-manager config (`**` matches no folder too, so the root's own
+ * count: tried on Claude Code 2.1.332); the folders runs link out of or install code into; and lefthook's own files,
+ * which have no dot. Inverted, so a new config name needs no new line here.
+ */
+const ASKS_IN_WORKTREE = [
+  '**/.*',
+  '**/.*/**',
+  '**/node_modules/**',
+  '**/venv/**',
+  '**/vendor/**',
+  '**/lefthook*.yml',
+  '**/lefthook*.yaml',
+];
+/** Claude Code's own user settings, where it reads them (CLAUDE_CONFIG_DIR, else ~/.claude). */
+const userSettingsPath = () =>
+  join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'settings.json');
+/**
+ * Git with no hook and no fsmonitor, for every call that makes or reads a run's worktree: a repo's hooks (even a
+ * tracked folder a relative core.hooksPath names, which comes with the base anyone who can push controls) never run
+ * from here (the last pass of 25 Nov).
+ */
+const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false'];
+/** A branch name a job's base may be: letters, digits and . _ / -, never an option, never a range. */
+const BASE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/;
+/**
+ * Makes a run's worktree itself, where Claude Code would (`<repo>/.claude/worktrees/<name>`, branch
+ * `worktree-<name>`), at one commit it resolved: its signed base on origin, fetched just now. Claude Code reopens a
+ * worktree of that name rather than making another (tried on 2.1.332), so the run starts in exactly the tree checked
+ * here. Null when it can't: a base that isn't a plain branch name, no fetch, no commit, or a worktree already there.
+ * Then Claude Code makes it as before, and the run gets no rule.
+ */
+export function prepareWorktree(job, repoPath, run = spawnSync) {
+  const base = job?.base;
+  if (typeof base !== 'string' || !BASE.test(base) || base.includes('..')) return null;
+  const repo = realOf(repoPath);
+  const name = worktreeOf(job);
+  const wt = join(repo, '.claude', 'worktrees', name);
+  if (existsSync(wt)) return null;
+  const git = (...args) =>
+    run('git', [...NO_HOOKS, '-C', repo, ...args], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 60_000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
+  if (
+    git('fetch', '--quiet', '--no-tags', 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`)
+      .status !== 0
+  )
+    return null;
+  const c = git('rev-parse', '--verify', '-q', `refs/remotes/origin/${base}^{commit}`);
+  const commit = c.status === 0 ? String(c.stdout).trim() : '';
+  if (!/^[0-9a-f]{40,64}$/.test(commit)) return null;
+  if (git('worktree', 'add', '-q', '-b', `worktree-${name}`, wt, commit).status !== 0) return null;
+  return { wt: realOf(wt), commit };
+}
+/** Entries walked in a worktree, at most: past it, it counts as holding a link. */
+const WALK_MAX = 200_000;
+/**
+ * Whether the worktree could hold a link out of it: a link in the commit it was made at (git mode 120000), one on disk
+ * in it now (made by a hook or a tool at checkout), folders Claude Code links in (any `worktree` setting but baseRef,
+ * in the repo's settings or the user's), or files it copies in (.worktreeinclude). Anything it can't read counts as yes.
+ */
+const linksOut = (repo, made, userSettings) => {
+  try {
+    const tree = spawnSync('git', [...NO_HOOKS, '-C', repo, 'ls-tree', '-r', made.commit], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      maxBuffer: 256 * 1024 * 1024,
+    });
+    if (tree.status !== 0 || /^120000 /m.test(tree.stdout)) return true;
+    let seen = 0;
+    const stack = [made.wt];
+    while (stack.length) {
+      const d = stack.pop();
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        if (++seen > WALK_MAX) return true;
+        if (d === made.wt && e.name === '.git') continue;
+        if (e.isSymbolicLink()) return true;
+        if (e.isDirectory()) stack.push(join(d, e.name));
+      }
+    }
+    if (existsSync(join(repo, '.worktreeinclude'))) return true;
+    for (const f of [
+      join(repo, '.claude', 'settings.json'),
+      join(repo, '.claude', 'settings.local.json'),
+      userSettings,
+    ]) {
+      if (!existsSync(f)) continue;
+      const w = JSON.parse(readFileSync(f, 'utf8'))?.worktree;
+      if (w && typeof w === 'object' && Object.keys(w).some((k) => k !== 'baseRef')) return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+};
+/**
+ * The case self-test (the reviews of 25 Nov). On a disk that ignores case, a rule for lefthook.yml must also catch
+ * LEFTHOOK.yml. Claude Code 2.1.332 matched case variants here; each new version is probed once, at install and when
+ * its version changes, by asking it to write a case variant under such a rule with nobody to answer: the probe passes
+ * only when that write was asked for and refused. The answer is kept in runner.json by version. No version, no probe
+ * or a write that went through: no rule.
+ */
+export function caseSafe(claude = CLAUDE, run = spawnSync) {
+  const v = run(claude, ['--version'], {
+    encoding: 'utf8',
+    timeout: 30_000,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const version =
+    v.status === 0
+      ? String(v.stdout ?? '')
+          .trim()
+          .split(/\s+/)[0]
+      : '';
+  if (!/^\d+(\.\d+){1,3}$/.test(version)) return false;
+  const c = config();
+  if (c.caseProbe?.version === version && typeof c.caseProbe.safe === 'boolean') return c.caseProbe.safe;
+  const safe = probeCase(claude, run);
+  save({ ...config(), caseProbe: { version, safe, at: Date.now() } });
+  return safe;
+}
+function probeCase(claude, run) {
+  const d = join(HOME, 'probe', `case-${process.pid}-${Date.now()}`);
+  try {
+    privateFolder(d);
+    writeFileSync(join(d, 'case-probe'), '');
+    // A disk that keeps case: another case is another file, which nothing reads as the config, so no probe is needed.
+    if (!existsSync(join(d, 'CASE-PROBE'))) return true;
+    const real = realpathSync(d);
+    const settings = JSON.stringify({
+      permissions: { allow: [`Edit(/${real}/**)`], ask: [`Edit(/${real}/**/lefthook*.yml)`] },
+    });
+    const r = run(
+      claude,
+      [
+        '-p',
+        `Use the Write tool to create the file ${real}/LEFTHOOK.yml containing the word hi. Then reply DONE.`,
+        '--model',
+        'haiku',
+        '--setting-sources',
+        'project,local',
+        '--settings',
+        settings,
+        '--permission-prompts',
+        'none',
+        '--output-format',
+        'json',
+      ],
+      { cwd: real, encoding: 'utf8', timeout: 180_000, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    if (r.status !== 0 || existsSync(join(real, 'lefthook.yml'))) return false;
+    const denied = JSON.parse(String(r.stdout ?? '')).permission_denials;
+    return (
+      Array.isArray(denied) &&
+      denied.some((x) => /\/lefthook\.yml$/i.test(String(x?.tool_input?.file_path ?? '')))
+    );
+  } catch {
+    return false;
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+/**
+ * The founder's yes of 25 Nov 2026 (card c-3fbd604380f26b96, "Edits in its worktree free"): a run Merle starts edits
+ * files in its own worktree without asking. Claude Code's own permission settings, never a bypass and never acceptEdits
+ * (which also lets mkdir, mv, cp, rm and sed run unasked): one Edit allow rule for the worktree this runner made
+ * (`made`, prepareWorktree), absolute (`//`), which covers Write and NotebookEdit too. In the same settings, ask rules
+ * (never deny, since the intent is a question): every Bash command, so a command the user or the repo allows still asks
+ * before it runs code this run wrote (an ask beats an allow from any other source; tried on 2.1.332), and
+ * ASKS_IN_WORKTREE. A sandbox's own Bash allowance is off. A link out of the worktree asks under the allow anyway
+ * (tried on 2.1.332). Null, and no rule, so its edits ask as before: in plan mode, with no worktree it made, a path
+ * holding a character a rule reads as a pattern, the case self-test not passed (`caseOk`), or a worktree that could
+ * hold a link out of it (linksOut).
+ */
+export function runSettings(
+  job,
+  repoPath,
+  { userSettings = userSettingsPath(), made = null, caseOk = false } = {},
+) {
+  if (job.mode === 'plan' || !made || !caseOk) return null;
+  const repo = realOf(repoPath);
+  const wt = made.wt;
+  if (/[*?[\]{}()!\\]/.test(wt) || /\p{Cc}/u.test(wt)) return null;
+  if (linksOut(repo, made, userSettings)) return null;
+  return JSON.stringify({
+    permissions: {
+      allow: [`Edit(/${wt}/**)`],
+      ask: ['Bash', ...ASKS_IN_WORKTREE.map((p) => `Edit(/${wt}/${p})`)],
+    },
+    // A sandbox set to allow Bash on its own skips a bare Bash ask (Claude Code's permissions docs): off for the run.
+    sandbox: { autoAllowBashIfSandboxed: false },
+  });
+}
 
 /** Starts one checked job: `claude --bg` in its repo, the session's short id back, kept in this Mac's own record. */
 export function startJob(job, repo) {
@@ -1678,6 +2195,13 @@ export function startJob(job, repo) {
       worktreeOf(job),
       '--permission-mode',
       job.mode,
+      // Its own worktree's edits free, nothing else (runSettings): never a variadic flag before the task.
+      // The case check first: with no rule to give, the runner makes no worktree and fetches nothing.
+      ...((w) => (w ? ['--settings', w] : []))(
+        job.mode === 'plan' || !caseSafe()
+          ? null
+          : runSettings(job, repo.path, { made: prepareWorktree(job, repo.path), caseOk: true }),
+      ),
       taskOf(job.ref, job),
     ],
     { cwd: repo.path, encoding: 'utf8' },
@@ -1762,8 +2286,13 @@ async function stops(list, pin, now) {
   return done;
 }
 
-const confirmed = (job, repo) => {
-  if (!repo.confirm || process.env.MERLE_RUNNER_NO_DIALOG) return true;
+/**
+ * The dialog a folder allowed with --confirm asks for before each run. Only a Mac can show it (osascript): asked for
+ * anywhere else, the run is refused, never started without it.
+ */
+export const confirmed = (job, repo, platform = process.platform) => {
+  if (!repo?.confirm || process.env.MERLE_RUNNER_NO_DIALOG) return true;
+  if (platform !== 'darwin') return false;
   const text = `Merle asks to start ${job.ref} in ${repo.remote} (${job.mode}).\n\n${taskOf(job.ref, job)}`;
   const r = spawnSync('osascript', [
     '-e',
@@ -1804,12 +2333,12 @@ const stillOk = (job) => {
 /** One look for jobs: each is checked, logged here and in Merle, and started or refused. */
 export async function once(now = Date.now(), wait = 25) {
   const pin = kept();
-  if (!pin) throw Error(`This Mac isn’t paired. Pair it: ${me()} pair`);
+  if (!pin) throw Error(`${Here} isn’t paired. Pair it: ${me()} pair`);
   const c = config();
   // Only as many as there's room for: the rest stay queued on Merle, never dropped. Paused or full, it asks for none,
-  // and still takes the stops waiting for it: stopping is the safe direction.
+  // and still takes the stops waiting for it: stopping is the safe direction. A pairing with no passkey asks for none.
   const going = sessionsOf(c).filter((s) => s.state === 'working' || s.state === 'blocked').length;
-  const room = c.paused ? 0 : Math.max(Math.min((c.max ?? 3) - going, 10), 0);
+  const room = c.paused || !takesJobs(pin) ? 0 : Math.max(Math.min((c.max ?? 3) - going, 10), 0);
   // Which products this Mac allows, so Merle offers its one key only for those (docs/loop.md). Ids only, no folders.
   const products = [...new Set(c.repos.map((r) => r.product))].join(',');
   const got = await (
@@ -1848,7 +2377,9 @@ export async function once(now = Date.now(), wait = 25) {
   for (const { job, assertion } of jobs) {
     let why;
     try {
-      why = refusal(job, assertion ?? {}, pin, { now, seen: seenNonce, repos: c.repos });
+      why = takesJobs(pin)
+        ? refusal(job, assertion ?? {}, pin, { now, seen: seenNonce, repos: c.repos })
+        : 'delivery only';
       if (!why) keepNonce(job.nonce, job.expires, now); // taken: never again, whatever happens next
     } catch {
       why = UNREADABLE; // a store it can't read refuses the job: never run without knowing it's new
@@ -1979,6 +2510,9 @@ export async function tick(now = Date.now()) {
 }
 
 async function run() {
+  // Only absolute folders on its PATH, whatever started it: no command is ever found in the repo a job runs in.
+  process.env.PATH = absolutePath(process.env.PATH);
+  privateFolder(HOME); // nobody else can change what it keeps, or what the service runs
   log({ event: 'runner started' }); // throws if the log can't be written: nothing runs without it
   watchSpool();
   for (;;) {
@@ -1999,39 +2533,174 @@ export const RUNNER_SCRIPT = join(HOME, 'runner', 'merle-runner.mjs');
  */
 const me = () => `node ${shellWord(RUNNER_SCRIPT)}`;
 
-function install() {
+/**
+ * How it keeps running here: launchd on a Mac; in a container (Docker's /.dockerenv, Podman's /run/.containerenv,
+ * MERLE_RUNNER_CONTAINER=1 or --container) as its entrypoint, with no service; a systemd user unit where systemctl is;
+ * else by hand.
+ */
+export function serviceOf(
+  platform = process.platform,
+  env = process.env,
+  exists = existsSync,
+  has = onPath,
+  container = false,
+) {
+  if (
+    container ||
+    env.MERLE_RUNNER_CONTAINER === '1' ||
+    exists('/.dockerenv') ||
+    exists('/run/.containerenv')
+  )
+    return 'container';
+  if (platform === 'darwin') return 'launchd';
+  return has('systemctl') ? 'systemd' : 'none';
+}
+const UNIT = 'merle-runner.service';
+/**
+ * Where its systemd user unit goes: ~/.config/systemd/user, where the user manager always looks. Never
+ * $XDG_CONFIG_HOME, which the manager may not share with the shell that ran install.
+ */
+export const unitPath = (home = homedir()) => join(home, '.config', 'systemd', 'user', UNIT);
+/**
+ * One word for a systemd unit line: double-quoted, its backslashes and quotes escaped, and % doubled so systemd expands
+ * no specifier in it; on ExecStart $ too (`dollar`), which Environment= never expands. A line break would start a new
+ * setting, so a word holding any control character is refused.
+ */
+const unitWord = (w, dollar = true) => {
+  const s = String(w);
+  if (/\p{Cc}/u.test(s)) throw Error('A path for the systemd unit holds a control character.');
+  const q = s.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('%', '%%');
+  return `"${dollar ? q.replaceAll('$', '$$$$') : q}"`;
+};
+/** A PATH with only its absolute folders: a relative one would find a command in whatever folder a job runs in. */
+export const absolutePath = (p) =>
+  String(p ?? '')
+    .split(':')
+    .filter((d) => isAbsolute(d))
+    .join(':');
+/** The systemd user unit: this Node running this copy, restarted when it stops. It holds no secret. */
+export const systemdUnit = (node, script, path) => `[Unit]
+Description=Merle runner
+After=network-online.target
+
+[Service]
+ExecStart=${unitWord(node)} ${unitWord(script)} ${unitWord('run')}
+Environment=${unitWord(`PATH=${absolutePath(path)}`, false)}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+`;
+const plistOf = (home) => join(home, 'Library', 'LaunchAgents', `${AGENT}.plist`);
+
+/**
+ * Copies this script (and the session hook beside it) into its folder, then sets it to keep running the way this
+ * system does (serviceOf). `run` is spawnSync for launchctl and systemctl; tests fake it and the system.
+ */
+export function install({
+  platform = process.platform,
+  env = process.env,
+  home = homedir(),
+  run = spawnSync,
+  exists = existsSync,
+  has = onPath,
+  container = false,
+  say = console.log,
+} = {}) {
   const to = RUNNER_SCRIPT;
-  mkdirSync(dirname(to), { recursive: true });
-  copyFileSync(fileURLToPath(import.meta.url), to);
-  chmodSync(to, 0o700);
+  // Its folder and the two it copies into, private, with nothing above them anyone else can change.
+  privateFolder(HOME);
+  privateFolder(dirname(to));
+  /** A copy made new beside the target, then renamed over it: never written through a link left at its name. */
+  const put = (from, at) => {
+    if (resolve(from) === resolve(at)) return chmodSync(at, 0o700);
+    const tmp = `${at}.${process.pid}.tmp`;
+    rmSync(tmp, { force: true });
+    writeFileSync(tmp, readFileSync(from), { mode: 0o700, flag: 'wx' });
+    renameSync(tmp, at);
+  };
+  put(fileURLToPath(import.meta.url), to);
   // The session hook from the same copy of the plugin, so the two always match (it imports this file).
   const hook = join(dirname(fileURLToPath(import.meta.url)), '..', 'hooks', 'session-hook.mjs');
   if (existsSync(hook) && resolve(hook) !== resolve(HOOK_SCRIPT)) {
-    mkdirSync(dirname(HOOK_SCRIPT), { recursive: true });
-    copyFileSync(hook, HOOK_SCRIPT);
-    chmodSync(HOOK_SCRIPT, 0o700);
+    privateFolder(dirname(HOOK_SCRIPT));
+    put(hook, HOOK_SCRIPT);
   }
-  const plist = join(homedir(), 'Library', 'LaunchAgents', `${AGENT}.plist`);
-  mkdirSync(dirname(plist), { recursive: true });
   const node = process.execPath;
-  writeFileSync(
-    plist,
-    `<?xml version="1.0" encoding="UTF-8"?>
+  const hash = createHash('sha256').update(readFileSync(to)).digest('hex');
+  say(`Installed ${to}\nIts SHA-256: ${hash}\nRun it from now on as: ${me()}`);
+  // The case self-test for this Claude Code (caseSafe), once per version: said only when runs won't edit freely.
+  if (!caseSafe())
+    say(
+      'Claude Code didn’t pass the case check here (or isn’t installed), so a run’s edits in its worktree ask, as every command does.',
+    );
+  const how = serviceOf(platform, env, exists, has, container);
+  if (how === 'launchd') {
+    const plist = plistOf(home);
+    mkdirSync(dirname(plist), { recursive: true });
+    writeFileSync(
+      plist,
+      `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>${AGENT}</string>
 <key>ProgramArguments</key><array><string>${node}</string><string>${to}</string><string>run</string></array>
-<key>EnvironmentVariables</key><dict><key>PATH</key><string>${process.env.PATH}</string></dict>
+<key>EnvironmentVariables</key><dict><key>PATH</key><string>${absolutePath(env.PATH)}</string></dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
 <key>StandardErrorPath</key><string>${join(dirname(LOG), 'runner.err')}</string>
 </dict></plist>
 `,
+    );
+    run('launchctl', ['unload', plist], {});
+    run('launchctl', ['load', plist], {});
+    return how;
+  }
+  if (how === 'systemd') {
+    const unit = unitPath(home);
+    // What the service runs is named here, so nobody else may change this folder either.
+    privateFolder(dirname(unit));
+    writeFileSync(unit, systemdUnit(node, to, env.PATH ?? '/usr/bin:/bin'), { mode: 0o600 });
+    run('systemctl', ['--user', 'daemon-reload'], {});
+    const r = run('systemctl', ['--user', 'enable', '--now', UNIT], {});
+    say(
+      r.status === 0
+        ? `It runs as a systemd user service: systemctl --user status ${UNIT}\nTo keep it running while you're logged out: loginctl enable-linger`
+        : `The unit is at ${unit}, but systemctl couldn’t start it. Start it yourself: systemctl --user enable --now ${UNIT}\nTo keep it running while you're logged out: loginctl enable-linger`,
+    );
+    return how;
+  }
+  say(
+    how === 'container'
+      ? `In a container it runs as the entrypoint, with no service: ${node} ${to} run\nMount its pairing as a file and name it with MERLE_RUNNER_TOKEN_FILE (mode 400 or 600), and its folder as a volume, so nonces survive a restart.`
+      : `Nothing here keeps it running on its own. Start it yourself, and again after a restart: ${me()} run`,
   );
-  const hash = createHash('sha256').update(readFileSync(to)).digest('hex');
-  console.log(`Installed ${to}\nIts SHA-256: ${hash}\nRun it from now on as: ${me()}`);
-  spawnSync('launchctl', ['unload', plist]);
-  spawnSync('launchctl', ['load', plist]);
+  return how;
 }
+/** Takes away what install set to keep it running, and nothing of the person's own. */
+function uninstallService({ platform = process.platform, home = homedir(), run = spawnSync } = {}) {
+  if (platform === 'darwin') {
+    run('launchctl', ['unload', plistOf(home)], {});
+    return;
+  }
+  const unit = unitPath(home);
+  if (!existsSync(unit)) return;
+  run('systemctl', ['--user', 'disable', '--now', UNIT], {});
+  rmSync(unit, { force: true });
+  run('systemctl', ['--user', 'daemon-reload'], {});
+}
+
+/** With no terminal to type y in (a service, a container), pairing needs the fingerprint up front. */
+/**
+ * With no terminal (a service, a container), pairing needs the fingerprint up front, or a y on standard input from
+ * whatever stands in for the person there. Said first; nothing typed (end of input) pairs nothing.
+ */
+const headless = (flags) => {
+  if (!process.stdin.isTTY && !flags.expect)
+    console.log(
+      `No terminal here. Give the fingerprint Merle shows for your passkey: ${me()} pair --expect <fingerprint>, or type y below once you've compared it.`,
+    );
+};
 
 async function main(argv) {
   const [cmd, ...rest] = argv;
@@ -2040,17 +2709,19 @@ async function main(argv) {
   for (let i = 0; i < rest.length; i++)
     if (rest[i] === '--confirm') flags.confirm = true;
     else if (rest[i] === '--no-confirm') flags.confirm = false;
+    else if (rest[i] === '--container') flags.container = true;
     else if (rest[i]?.startsWith('--')) flags[rest[i].slice(2)] = rest[++i];
     else args.push(rest[i]);
   const c = config();
   switch (cmd) {
     case 'install':
-      install();
-      if (!kept()) await pair();
+      // Refused before anything is copied when nobody can type y and no fingerprint was given.
+      if (!kept()) headless(flags);
+      install({ container: flags.container === true });
+      if (!kept()) await pair(ask, console.log, flags.expect ?? null);
       return;
     case 'uninstall': {
-      const plist = join(homedir(), 'Library', 'LaunchAgents', `${AGENT}.plist`);
-      spawnSync('launchctl', ['unload', plist]);
+      uninstallService();
       // Merle's hooks in Codex and Cursor go too; the person's own stay.
       for (const client of Object.keys(CLIENT_HOOKS)) clientHooks(client, 'off', true);
       await unpair();
@@ -2058,7 +2729,10 @@ async function main(argv) {
       return;
     }
     case 'pair':
-      return pair();
+      headless(flags);
+      // Not paired (a fingerprint that didn't match, or no y): a script running this hears it.
+      if (!(await pair(ask, console.log, flags.expect ?? null))) process.exitCode = 1;
+      return;
     case 'unpair':
       return unpair();
     case 'allow':
@@ -2316,7 +2990,7 @@ function clientHooks(client, off, quiet = false) {
     return;
   }
   console.log(`Added Merle’s hooks to ${path}. ${c.done}`);
-  if (!kept()) console.log(`This Mac isn’t paired yet, so they do nothing until it is: ${me()} pair`);
+  if (!kept()) console.log(`${Here} isn’t paired yet, so they do nothing until it is: ${me()} pair`);
   else if (!config().repos.length)
     console.log(
       `No folder is allowed yet, so no session checks in: ${me()} allow <folder> --product <product id>`,
@@ -2324,14 +2998,36 @@ function clientHooks(client, off, quiet = false) {
 }
 
 async function unpair() {
-  const k = kept();
-  if (k) await api(`/v1/runner/unpair`, { method: 'POST' }).catch(() => {});
+  // A store that gives nothing while runner.json says paired (readPairing): unpair still goes on, and says so.
+  let k = null;
+  let gone = false;
+  try {
+    k = kept();
+  } catch {
+    gone = true;
+  }
+  // Whether Merle heard: its token revoked there too. Said plainly when it didn't, so nobody takes it for done there.
+  const heard = k
+    ? await api(`/v1/runner/unpair`, { method: 'POST' }).then(
+        (r) => r.ok,
+        () => false,
+      )
+    : !gone;
+  // Clears the store and the word together; a store it still can't clear (a keyring locked) keeps the word, and throws.
   keep(null);
+  if (gone)
+    console.log(
+      `The pairing was already gone from its store here, so the word that ${HERE} is paired is cleared.`,
+    );
   clearPauses();
   // The Agent calls held for helpers' tasks go too (hooks/event.mjs holdCall); uninstall unpairs, so it does as well.
   rmSync(join(HOME, 'pending'), { recursive: true, force: true });
-  log({ event: 'unpaired' });
-  console.log('Unpaired. This Mac takes no jobs now.');
+  log({ event: 'unpaired', merle: heard ? 'heard' : 'not reached' });
+  console.log(
+    heard
+      ? `Unpaired. ${Here} takes no jobs now.`
+      : `Unpaired here: ${HERE} takes no jobs now. Merle didn’t hear it, so its token still works there until you remove it in Merle.`,
+  );
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))

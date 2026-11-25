@@ -32,10 +32,24 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const HOME =
-  process.env.MERLE_RUNNER_HOME ?? join(homedir(), 'Library', 'Application Support', 'Merle');
-export const LOG =
-  process.env.MERLE_RUNNER_LOG ?? join(homedir(), 'Library', 'Logs', 'Merle', 'runner.jsonl');
+/**
+ * The runner's folder and logs on this system, as merle-runner.mjs placesOf has them (a test holds them equal): a Mac's
+ * ~/Library, else ~/.local/state/merle (fixed, never $XDG_STATE_HOME). Its own copy, so this hook imports nothing but
+ * Node's own.
+ */
+export function placesOf(platform = process.platform, _env = process.env, home = homedir()) {
+  if (platform === 'darwin')
+    return {
+      home: join(home, 'Library', 'Application Support', 'Merle'),
+      logs: join(home, 'Library', 'Logs', 'Merle'),
+    };
+  return {
+    home: join(home, '.local', 'state', 'merle'),
+    logs: join(home, '.local', 'state', 'merle', 'logs'),
+  };
+}
+export const HOME = process.env.MERLE_RUNNER_HOME ?? placesOf().home;
+export const LOG = process.env.MERLE_RUNNER_LOG ?? join(placesOf().logs, 'runner.jsonl');
 const SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
 
 /**

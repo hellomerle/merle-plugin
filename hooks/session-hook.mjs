@@ -42,6 +42,7 @@ import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import {
   canonical,
+  checkFolder,
   config,
   HOME,
   HOOK_SETTINGS,
@@ -946,6 +947,12 @@ async function signing(on) {
 const insideAgent = (input) => typeof input?.agent_id === 'string' && input.agent_id.length > 0;
 
 async function main([cmd, arg]) {
+  // Nothing from a folder someone else could change (merle-runner.mjs checkFolder): such a hook does nothing at all.
+  try {
+    checkFolder(HOME);
+  } catch {
+    return 0;
+  }
   switch (cmd) {
     case 'start':
     case 'next-note': {
