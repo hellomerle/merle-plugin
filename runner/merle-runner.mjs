@@ -284,6 +284,69 @@ export function stopRefusal(stop, a, pin, { now, mine, requireSigned, seen }) {
   return null;
 }
 
+/** Everything a restart holds, and nothing else (R-574). */
+const RESTART_KEYS = new Set([
+  'v',
+  'type',
+  'id',
+  'runner',
+  'job',
+  'ref',
+  'product',
+  'repo',
+  'mode',
+  'created',
+  'expires',
+  'nonce',
+  'text',
+]);
+/** Restarts a run may have in a day on this Mac (Merle counts the same). */
+const RESTARTS_A_DAY = 3;
+/** A restart's words: Merle's template with note ids, and nothing else (Merle's wakes.ts wakeText). */
+export const RESTART_TEXT =
+  /^Merle: \d{1,2} items? for you \(n-[a-z]{8}(?:, n-[a-z]{8}){0,19}\)\. Read them with inbox\.$/;
+/**
+ * Why this Mac won't resume a run on Merle's word, or null (R-574; the founder's card of 25 Nov 2026: "Yes, same mode as
+ * starts"). Only a run it started itself (`mine`, its own record), for the same request and product, in a repo still
+ * on its list, in the mode its start was signed for, never after a Stop here, three a day, with Merle's template as its
+ * only words; and signed exactly as a Start is (the pinned passkey), never less.
+ */
+export function restartRefusal(r, a, pin, { now, mine, seen, repos }) {
+  if (!r || r.v !== 1) return 'version';
+  if (r.type !== 'restart') return 'type';
+  if (Object.keys(r).some((k) => !RESTART_KEYS.has(k))) return 'keys';
+  if (r.runner !== pin.runner) return 'runner';
+  if (typeof r.id !== 'string' || !/^t-[a-f0-9]{16}$/.test(r.id)) return 'shape';
+  if (typeof r.job !== 'string' || !JOB_ID.test(r.job)) return 'shape';
+  if (typeof r.nonce !== 'string' || !/^[A-Za-z0-9_-]{16,}$/.test(r.nonce)) return 'nonce';
+  if (!MODES.includes(r.mode)) return 'mode';
+  if (typeof r.text !== 'string' || !RESTART_TEXT.test(r.text)) return 'words';
+  const rec = mine(r.job);
+  if (!rec || rec.ref !== r.ref || rec.product !== r.product) return 'not started here';
+  // A person's Stop here ends it for good: never resumed on Merle's word, whatever Merle says (#677's review).
+  if (rec.stoppedAt) return 'stopped here';
+  // Only the mode its start was signed for, never more however wide the repo's: a record that doesn't say is refused.
+  if (r.mode !== rec.mode) return 'mode';
+  const repo = repos.find((x) => x.product === r.product && x.remote === r.repo);
+  if (!repo || repo.path !== rec.path) return 'repo not allowed here';
+  if (MODES.indexOf(r.mode) > MODES.indexOf(repo.mode)) return 'mode';
+  const fresh =
+    r.created <= now + 60_000 &&
+    now < r.expires &&
+    r.expires - r.created <= STOP_MS &&
+    r.expires <= now + STOP_MS + MARGIN_MS;
+  if (!fresh) return 'expired';
+  // Three a day here too, whatever Merle counts (#677's read, H1).
+  const today = new Date(now).toISOString().slice(0, 10);
+  if (rec.restarts?.day === today && rec.restarts.n >= RESTARTS_A_DAY) return 'too many today';
+  // Signed as a Start is, never less, whatever this Mac's own setting for notes (#677's read, H1).
+  if (!a) return 'unsigned';
+  const why = signedBy('restart', canonical(r), a, pin);
+  if (why) return why;
+  if (seen(r.nonce)) return 'replayed';
+  return null;
+}
+
 /** Which kinds of thing a passkey signs here. Each says what it is in the challenge, so one never passes as another. */
 /**
  * The version of reading's own words: what `reading on` prints here (READING_SAYS) and what Merle's page shows beside
@@ -295,7 +358,7 @@ export function stopRefusal(stop, a, pin, { now, mine, requireSigned, seen }) {
 export const READING_WORDS = 3;
 /** Each version this copy knows, and the domain its ask is signed under. */
 export const READING_DOMAINS = new Map([[3, 'reading-on-3']]);
-const DOMAINS = ['job', 'note', 'signing-off', 'stop', 'reading-on', ...READING_DOMAINS.values()];
+const DOMAINS = ['job', 'note', 'signing-off', 'stop', 'restart', 'reading-on', ...READING_DOMAINS.values()];
 /** The domain a reading-on ask is signed under: its words' own; the plain one when it names none; null when unknown here. */
 const readingDomain = (o) => (o?.words === undefined ? 'reading-on' : (READING_DOMAINS.get(o.words) ?? null));
 /** The WebAuthn challenge for a job or a note: SHA-256 of "merle-<domain>", a zero byte, then its exact bytes. */
@@ -1332,6 +1395,8 @@ export function nonceStore(path, missing = () => ({})) {
 const jobNonces = nonceStore(NONCES, fromLog);
 /** Stops keep their own store: a stop's nonce never spends a job's. */
 const stopNonces = nonceStore(join(HOME, 'stops-nonces.json'));
+/** And restarts theirs (R-574). */
+const restartNonces = nonceStore(join(HOME, 'restarts-nonces.json'));
 export const seenNonce = jobNonces.seen;
 export const keepNonce = jobNonces.keep;
 export const takeNonce = jobNonces.take;
@@ -2176,7 +2241,8 @@ export function runSettings(
 /** Starts one checked job: `claude --bg` in its repo, the session's short id back, kept in this Mac's own record. */
 export function startJob(job, repo) {
   // Its record first: a run this Mac can't keep a record of is one it couldn't stop, so it doesn't start.
-  const rec = { path: repo.path, ref: job.ref, product: job.product, at: Date.now() };
+  // With the mode its start was signed for: a restart resumes under that mode and no other (R-574, #677's review).
+  const rec = { path: repo.path, ref: job.ref, product: job.product, mode: job.mode, at: Date.now() };
   try {
     startedKeep(job.id, rec);
   } catch {
@@ -2243,6 +2309,124 @@ export function stopJob(jobId) {
   if (out.status !== 0) throw Error(printable(out.stderr || 'claude stop failed').slice(0, 120));
   startedKeep(jobId, { stoppedAt: Date.now() });
   return short;
+}
+
+/**
+ * Resumes a session this Mac started (R-574): only that run's own session, as Claude Code lists it under its name, not
+ * going, in the run's own worktree; under the restart's mode with the worktree's rules (runSettings), and Merle's
+ * template as its only words. Claude Code's own `--bg --resume` keeps the session's id.
+ */
+export function restartJob(r, repo) {
+  const rec = started()[r.job];
+  const short = rec?.short;
+  if (typeof short !== 'string' || !/^[0-9a-f]{4,12}$/.test(short)) throw Error('not started here');
+  // Read again right before it runs: a Stop or another mode since the check refuses it.
+  if (rec.stoppedAt) throw Error('stopped here');
+  if (!MODES.includes(rec.mode) || rec.mode !== r.mode) throw Error('mode');
+  let list = [];
+  try {
+    list = JSON.parse(
+      execFileSync(CLAUDE, ['agents', '--json', '--all', '--cwd', rec.path], { encoding: 'utf8' }),
+    );
+  } catch {
+    throw Error('not listed');
+  }
+  const s = Array.isArray(list) ? list.find((x) => x?.id === short) : null;
+  if (!s || s.name !== `merle ${rec.ref}`) throw Error('not started here');
+  if (s.state === 'working' || s.state === 'blocked') throw Error('going');
+  // Only a clean end: a session stopped by hand (`claude stop`), failed or anything else isn't resumed (#677's read).
+  if (s.state !== 'done') throw Error('not a clean end');
+  const wt = join(realOf(repo.path), '.claude', 'worktrees', worktreeOf({ ref: r.ref, id: r.job }));
+  if (typeof s.cwd !== 'string' || !existsSync(wt) || !existsSync(s.cwd) || realOf(s.cwd) !== realOf(wt))
+    throw Error('not in its own worktree');
+  if (typeof s.sessionId !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(s.sessionId))
+    throw Error('no session to resume');
+  const head = spawnSync('git', [...NO_HOOKS, '-C', wt, 'rev-parse', 'HEAD'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const commit = head.status === 0 ? String(head.stdout).trim() : '';
+  const settings =
+    rec.mode === 'plan' || !caseSafe() || !/^[0-9a-f]{40,64}$/.test(commit)
+      ? null
+      : runSettings({ mode: rec.mode }, repo.path, { made: { wt: realOf(wt), commit }, caseOk: true });
+  const out = spawnSync(
+    CLAUDE,
+    [
+      '--bg',
+      '--resume',
+      s.sessionId,
+      '--permission-mode',
+      rec.mode,
+      ...(settings ? ['--settings', settings] : []),
+      r.text,
+    ],
+    { cwd: wt, encoding: 'utf8' },
+  );
+  if (out.status !== 0) throw Error(printable(out.stderr || 'claude didn’t resume').slice(0, 120));
+  // Its id only in Claude Code's own "backgrounded ·" form; anything else keeps the one it had (#677's read, L2).
+  const next = /backgrounded\s*·\s*([0-9a-f]{4,12})\b/.exec(out.stdout)?.[1] ?? short;
+  const today = new Date().toISOString().slice(0, 10);
+  const n = rec.restarts?.day === today ? rec.restarts.n : 0;
+  // Merged into its record (startedKeep): the mode and any Stop it holds stay as they were.
+  startedKeep(r.job, { short: next, restartedAt: Date.now(), restarts: { day: today, n: n + 1 } });
+  return next;
+}
+
+/** Each restart Merle passed on: checked, logged here and in Merle, and resumed or refused (R-574). */
+async function restarts(list, pin, now) {
+  const c = config();
+  for (const { restart: r, assertion } of list.slice(0, 10)) {
+    let why;
+    try {
+      why = c.paused
+        ? 'paused on this Mac'
+        : !takesJobs(pin)
+          ? 'delivery only'
+          : restartRefusal(r, assertion ?? null, pin, {
+              now,
+              mine: (id) => started()[id] ?? null,
+              seen: restartNonces.seen,
+              repos: c.repos,
+            });
+      if (!why) restartNonces.keep(r.nonce, r.expires, now);
+    } catch {
+      why = UNREADABLE;
+    }
+    // A restart is a start: only with room, as a job.
+    if (
+      !why &&
+      sessionsOf(c).filter((x) => x.state === 'working' || x.state === 'blocked').length >= (c.max ?? 3)
+    )
+      why = 'full';
+    let session = null;
+    if (!why)
+      try {
+        log({
+          event: 'restarting',
+          restart: r.id,
+          job: r.job,
+          ref: r.ref,
+          mode: r.mode,
+          signed: !!assertion,
+        });
+        session = restartJob(
+          r,
+          c.repos.find((x) => x.product === r.product && x.remote === r.repo),
+        );
+      } catch (err) {
+        why = printable(err.message ?? err).slice(0, 120);
+      }
+    log({ event: why ? 'restart refused' : 'restarted', restart: r?.id, job: r?.job, reason: why, session });
+    await api(`/v1/runner/restarts/${r?.id}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        state: why ? 'refused' : 'done',
+        ...(why ? { reason: why } : {}),
+        ...(session ? { session } : {}),
+      }),
+    }).catch(() => {});
+  }
 }
 
 /** Each stop Merle passed on: checked, logged here and in Merle, and done or refused. */
@@ -2343,7 +2527,7 @@ export async function once(now = Date.now(), wait = 25) {
   const products = [...new Set(c.repos.map((r) => r.product))].join(',');
   const got = await (
     await api(
-      `/v1/runner/jobs?wait=${wait}&limit=${room}&v=5&products=${encodeURIComponent(products)}&helpers=${readingOn(pin) ? (readingHelpers(pin) ? READING_WORDS : 0) : ''}${SELF ? `&runner=${SELF}` : ''}`,
+      `/v1/runner/jobs?wait=${wait}&limit=${room}&v=6&products=${encodeURIComponent(products)}&helpers=${readingOn(pin) ? (readingHelpers(pin) ? READING_WORDS : 0) : ''}${SELF ? `&runner=${SELF}` : ''}`,
       {
         // Its wait and a full minute more: Merle marks a stop or a job delivered before it answers, so a look given up
         // too soon could lose one. A reply lost on the way (the connection or the Worker gone) still can, as before.
@@ -2371,6 +2555,7 @@ export async function once(now = Date.now(), wait = 25) {
   const jobs = Array.isArray(got?.jobs) ? got.jobs : [];
   const done = [];
   if (Array.isArray(got?.stops) && got.stops.length) await stops(got.stops, pin, now);
+  if (Array.isArray(got?.restarts) && got.restarts.length) await restarts(got.restarts, pin, now);
   // Pauses before jobs, room or not: pausing is the safe way. One Merle didn't take is handed over again; the next look
   // waits a little first (`untold`), so a Mac that can't answer doesn't ask in a tight loop.
   if (Array.isArray(got?.pauses) && got.pauses.length && !(await pauses(got.pauses))) untold = true;
