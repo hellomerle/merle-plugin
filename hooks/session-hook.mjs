@@ -524,6 +524,43 @@ export function goalsLine(goals, signedOnly = false) {
     : [];
 }
 
+/**
+ * Merle's brief of the product from the check-in (docs/coordination.md §2): the requests agents are on and the last
+ * merges, from Merle's own records. Only refs, stages, counts, pull request numbers and times pass, each checked by its
+ * shape here: anything else in the answer is dropped, so no words can ride in.
+ */
+const STAGES = new Set([
+  'needs_decision',
+  'in_progress',
+  'waiting_to_go_live',
+  'checking',
+  'done',
+  'later',
+  'answered',
+]);
+const BRIEF_REF = /^R-\d{1,9}$/;
+const BRIEF_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+const count = (x) => Number.isSafeInteger(x) && x >= 0;
+export function briefLine(brief) {
+  const b = brief && typeof brief === 'object' ? brief : {};
+  const on = (Array.isArray(b.agents_on) ? b.agents_on : [])
+    .filter((x) => x && BRIEF_REF.test(x.request) && STAGES.has(x.stage) && count(x.agents) && x.agents > 0)
+    .slice(0, 10)
+    .map((x) => `${x.request} (${x.stage}, ${x.agents === 1 ? '1 agent' : `${x.agents} agents`})`);
+  const merged = (Array.isArray(b.last_merges) ? b.last_merges : [])
+    .filter(
+      (x) => x && BRIEF_REF.test(x.request) && BRIEF_AT.test(x.at) && (x.pull === undefined || count(x.pull)),
+    )
+    .slice(0, 3)
+    .map((x) => `${x.request}${x.pull ? ` by #${x.pull}` : ''} at ${x.at}`);
+  if (!on.length && !merged.length) return [];
+  return [
+    `Merle’s records for this product, ids, stages and times only: ${
+      on.length ? `agents are on ${on.join(', ')}` : 'no agent is on a request now'
+    }; ${merged.length ? `last merges ${merged.join(', ')}` : 'no merges yet'}. Before you build a request, read it with get_request: its coordination block says who else is on it and whether its work already merged.`,
+  ];
+}
+
 async function start(input, client) {
   const pin = ready(input);
   if (!pin) return 0;
@@ -540,6 +577,7 @@ async function start(input, client) {
     }`,
     `When you call post_update, put session: "${short}" on it.`,
     ...goalsLine(r.goals, required()),
+    ...briefLine(r.coordination),
   ].join(' ');
   process.stdout.write(`${JSON.stringify(outputOf(client, 'SessionStart', context))}\n`);
   return 0;
