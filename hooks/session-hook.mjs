@@ -147,6 +147,12 @@ const NOTE_KEYS = new Set([
 const AGENT_KEY = /^sub-[0-9a-f]{8}$/;
 /** Seconds Merle holds one look open; the waiting hook looks again at once after. */
 const WAIT = Math.max(1, Math.min(25, Number(process.env.MERLE_HOOK_WAIT) || 25));
+/**
+ * The waiter's socket (Merle's wakes.ts): a keep-alive Merle's edge answers without waking anything, and how often the
+ * waiter checks, on the Mac alone, that it's still the session's and still allowed. Seconds, for tests.
+ */
+const PING_MS = Math.max(1, Number(process.env.MERLE_HOOK_PING) || 300) * 1000;
+const CHECK_MS = Math.max(1, Number(process.env.MERLE_HOOK_CHECK) || 30) * 1000;
 /** A note waits a day for a sleeping Mac (sessions.ts NOTE_MS), plus a few minutes for clocks apart. */
 const NOTE_MS = 24 * 3_600_000;
 const MARGIN_MS = 5 * 60_000;
@@ -780,6 +786,103 @@ async function agentNote(input) {
   return 0;
 }
 
+/**
+ * The waiter on a socket (Merle's wakes.ts): Merle sends on it when a note lands for this session, and nothing is asked
+ * meanwhile. It looks once as it opens (anything queued before), once per wake, and once when the session's pause file
+ * changes, each the usual way (the signed note path). What a wake says is never read: it only says to look. Undefined
+ * when the socket won't open (an older Merle, no WebSocket in this Node): the caller looks every 25 seconds as before.
+ * Null when one that opened closes: the caller opens it again.
+ */
+async function sleepOnSocket(pin, input, still, mine) {
+  if (typeof WebSocket !== 'function' || process.env.MERLE_HOOK_POLL === '1') return undefined;
+  const url = `${pin.origin.replace(/^http/, 'ws')}/v1/runner/hook/wake?session=${encodeURIComponent(input.session_id)}`;
+  let ws;
+  try {
+    ws = new WebSocket(url, { headers: { authorization: `Bearer ${pin.token}` } });
+  } catch {
+    return undefined;
+  }
+  const opened = await new Promise((done) => {
+    const t = setTimeout(() => done(false), 10_000); // honesty: how long a socket may take to open; moves no stage
+    ws.onopen = () => (clearTimeout(t), done(true));
+    ws.onerror = () => (clearTimeout(t), done(false));
+    ws.onclose = () => (clearTimeout(t), done(false));
+  });
+  if (!opened) {
+    try {
+      ws.close();
+    } catch {}
+    return undefined;
+  }
+  let wake = () => {};
+  let signal;
+  const next = () => {
+    signal = new Promise((r) => {
+      wake = r;
+    });
+  };
+  next();
+  ws.onmessage = () => wake('wake');
+  ws.onclose = () => wake('closed');
+  ws.onerror = () => wake('closed');
+  const ping = () => {
+    try {
+      ws.send('ping');
+    } catch {}
+  };
+  const pinger = setInterval(ping, PING_MS); // honesty: a keep-alive Merle's edge answers; moves no stage
+  let pause = pausedRev(input.session_id);
+  let look = true;
+  try {
+    for (;;) {
+      if (look) {
+        look = false;
+        // As the poll does before every look: a note it can't log is never taken (the poll waits that out).
+        if (!logWritable() || unhookedHere(input)) return null;
+        let got;
+        try {
+          got = await api(
+            pin,
+            `/v1/runner/hook/notes?session=${input.session_id}&wait=0&paused=${pause ?? 'none'}`,
+          );
+        } catch (err) {
+          if (err?.status === 401) return 0; // the Mac was removed
+          return null;
+        }
+        if (got.unhooked) return null; // the poll looks slowly while it's unhooked
+        ratchet(got.signed);
+        // Merle handed these over once and won't again: deliver them even if a newer waiter took over meanwhile.
+        const words = await take(pin, got.notes ?? [], input, 'wait');
+        if (words.length) {
+          if (still()) rmSync(mine, { force: true });
+          process.stderr.write(`${words.join('\n\n---\n\n')}\n`);
+          return 2; // wakes the session (asyncRewake)
+        }
+      }
+      const what = await Promise.race([signal, sleep(CHECK_MS).then(() => 'check')]);
+      if (what === 'closed') return null;
+      if (what === 'wake') {
+        next();
+        look = true;
+        continue;
+      }
+      if (!still() || process.ppid === 1) return 0; // replaced, or the session that started it is gone
+      if (!allowed(input.cwd) || !kept()?.token) return 0;
+      if (!logWritable() || unhookedHere(input)) return null;
+      const now = pausedRev(input.session_id);
+      if (now !== pause) {
+        pause = now;
+        look = true;
+      }
+    }
+  } finally {
+    clearInterval(pinger);
+    try {
+      ws.close();
+    } catch {}
+  }
+}
+
 /** One waiter per session: the newest. An older one sees the pid file name another and ends. */
 async function wait(input) {
   const pin = ready(input);
@@ -794,6 +897,18 @@ async function wait(input) {
       return false;
     }
   };
+  // A socket first (wakes.ts), opened again when it closes, up to three times in a row; one that won't open, or a fourth
+  // close, and it looks every 25 seconds as before.
+  for (let tries = 0; tries < 3; tries++) {
+    if (!still() || process.ppid === 1) return 0;
+    if (!allowed(input.cwd) || !kept()?.token) return 0;
+    const t = Date.now();
+    const out = await sleepOnSocket(pin, input, still, mine);
+    if (out === undefined) break;
+    if (out !== null) return out;
+    if (Date.now() - t > 10 * 60_000) tries = 0; // it held a while: a closed one is opened again
+    await sleep(WAIT * 1000 * (tries + 1));
+  }
   for (;;) {
     if (!still() || process.ppid === 1) return 0; // replaced, or the session that started it is gone
     // The folder is checked again before every look: one taken off the Mac's list gets no more notes.
