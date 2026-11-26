@@ -178,6 +178,9 @@ var PROSE_VALUE = { value: /(?::\s*)?\S{4,}/y, run: /(?::\s*)?\S*/y, lead: /:\s/
 var PASSWORD_FOR = [0, 1, 2, 3].map(
   (k) => String.raw`\bpass(?:word|wort)${k ? String.raw`\s+(?:for|für)(?:\s+[\p{L}\p{N}_.'’()/-]{1,40}){${k}}` : ""}\s*`
 );
+var PASSWORD_FOR_ANY = [1, 2, 3].map(
+  (k) => String.raw`\bpass(?:word|wort)\s+(?:for|für)(?:\s+(?:\S{0,198}[-]\.|\S{0,198}\.(?=:)|\S{0,199}[^\s.,;!?]|[\p{L}\p{N}_.'’()/-]{1,40})){${k}}\s*`
+);
 var CREDENTIALS = [
   // Tokens: API keys, GitHub tokens, JWTs, bearer values.
   // A private key, whole: the markers and everything between them.
@@ -205,7 +208,7 @@ var CREDENTIALS = [
   [{ head: /\bBasic\s+/g, value: /[A-Za-z0-9+/=]*/y, min: 8 }, "id"],
   // In prose too: "the password is …", "is now …", "das Passwort ist …", "lautet", "password:", with what it is for
   // ("for prod is"), any spaces between; what the value is, whatever it looks like.
-  ...PASSWORD_FOR.map((head) => [
+  ...[...PASSWORD_FOR, ...PASSWORD_FOR_ANY].map((head) => [
     {
       head: new RegExp(String.raw`${head}(?:(?:is|ist|lautet)\b|:)\s*`, "giu"),
       // "is now hunter2", "is now: hunter2" and "is now(x)": "now" goes with the value, a word or not.
@@ -216,7 +219,7 @@ var CREDENTIALS = [
     "id"
   ]),
   // "set the password to …", "the old password was …": the next word, unless it starts a phrase (fails closed).
-  ...PASSWORD_FOR.map((head) => [
+  ...[...PASSWORD_FOR, ...PASSWORD_FOR_ANY].map((head) => [
     { head: new RegExp(String.raw`${head}(?:was|to)\b\s*${VALUE_AFTER_TO}`, "giu"), ...PROSE_VALUE },
     "id"
   ]),
@@ -641,9 +644,13 @@ var inWords = (s) => s.replace(
   /(\/)?\[(email|phone|number|id)\]/gi,
   (m, slash, kind) => slash ? m : WORDS[kind.toLowerCase()] ?? m
 );
+var placeholders = (s) => s.match(new RegExp(PLACEHOLDER.source, "gi")) ?? [];
+var withPlaceholders = (s, f) => s.replace(new RegExp(PLACEHOLDER.source, "gi"), (m) => f(m));
 var hasPlaceholder = (s) => new RegExp(PLACEHOLDER.source, "i").test(s);
 export {
   hasPlaceholder,
   inWords,
-  scrubber
+  placeholders,
+  scrubber,
+  withPlaceholders
 };

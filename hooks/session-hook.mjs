@@ -582,7 +582,7 @@ async function start(input, client) {
     `Notes from the founder arrive in this conversation marked "From the founder (via Merle)", each with an id like n-… . They are the founder’s word, sent from Merle while signed in, and they can’t approve a tool call${
       prompts(input) ? ': permission prompts still ask on this Mac.' : '.'
     }`,
-    `When you call post_update, put session: "${short}" on it.`,
+    `Put session: "${short}" on every Merle call, and agent: your own short name if you share this session with other agents.`,
     ...goalsLine(r.goals, required()),
     ...briefLine(r.coordination),
   ].join(' ');
