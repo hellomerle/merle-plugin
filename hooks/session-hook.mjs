@@ -173,6 +173,18 @@ const readInput = () => {
 };
 /** The coding agents besides Claude Code whose hooks run this script (merle-runner hooks codex|cursor). */
 const OTHER_CLIENTS = ['codex', 'cursor'];
+/**
+ * The machine this hook runs on, for Merle's record of where the session runs (docs/reach.md): from the computer's own
+ * platform and a container's own marks, never from anything the agent says. Null for one Merle has no name for.
+ */
+export function hostOf(platform = process.platform, env = process.env, has = existsSync) {
+  if (platform === 'darwin') return 'mac';
+  if (platform === 'win32') return 'windows';
+  if (platform !== 'linux') return null;
+  return env.MERLE_CONTAINER === '1' || has('/.dockerenv') || has('/run/.containerenv')
+    ? 'container'
+    : 'linux';
+}
 const git = (cwd, args) => {
   const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   return r.status === 0 ? r.stdout.trim() : '';
@@ -488,6 +500,7 @@ const postCheckin = (pin, input, event, client) =>
       ...(MODES.includes(input.permission_mode) ? { mode: input.permission_mode } : {}),
       ...(productFor(input.cwd) ? { product: productFor(input.cwd) } : {}),
       ...(OTHER_CLIENTS.includes(client) ? { client } : {}),
+      ...(hostOf() ? { host: hostOf() } : {}),
       // Claude Code's plugin only: Codex and Cursor run these hooks from Merle's download, with no plugin to update.
       ...(PLUGIN_VERSION && client === undefined ? { plugin: PLUGIN_VERSION } : {}),
       ...(HOOKS_SHA && client === undefined ? { hooks: HOOKS_SHA } : {}),
