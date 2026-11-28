@@ -31,14 +31,16 @@ export function placesOf(platform = process.platform, _env = process.env, home =
   };
 }
 const HOME = process.env.MERLE_RUNNER_HOME ?? placesOf().home;
+/** Merle's own app hosts, as merle-runner.mjs PROD_URLS: hellomerle.com's, and rhesa.app's during the move. */
+export const PROD_URLS = ['https://app.hellomerle.com', 'https://app.rhesa.app'];
 /**
- * This Mac's own folder only with hellomerle.com: a hook run for any other Merle (a test) with no folder of its own
- * writes nothing (the P0 of 22 Nov; merle-runner.mjs homeRefusal).
+ * This Mac's own folder only with Merle's own app hosts: a hook run for any other Merle (a test) with no folder of its
+ * own writes nothing (the P0 of 22 Nov; merle-runner.mjs homeRefusal).
  */
 const OFF =
   process.env.MERLE_RUNNER_HOME === undefined &&
   process.env.MERLE_URL !== undefined &&
-  process.env.MERLE_URL !== 'https://app.hellomerle.com';
+  !PROD_URLS.includes(process.env.MERLE_URL);
 const SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
 
 async function main() {

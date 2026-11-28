@@ -78,8 +78,13 @@ const same = (a, b) => {
   };
   return real(a) === real(b);
 };
-/** The one Merle this computer's own folder, its own pairing store and its logs are for. */
-const PROD = 'https://app.hellomerle.com';
+/**
+ * The Merle this computer's own folder, its own pairing store and its logs are for: its app host, and during the move
+ * to rhesa.app the new one too (docs/runner.md §1). The pairing is the same Merle on either: its token works on both,
+ * and its passkey signs only on the host it was made on, until this Mac pairs again there.
+ */
+export const PROD_URLS = ['https://app.hellomerle.com', 'https://app.rhesa.app'];
+const PROD_HOSTS = PROD_URLS.map((u) => new URL(u).host).join(' or ');
 const REAL_HOME = placesOf().home;
 const REAL_LOGS = placesOf().logs;
 /**
@@ -94,15 +99,15 @@ const REAL_LOGS = placesOf().logs;
 export function homeRefusal(env = process.env, keychain = false) {
   const asked = env.MERLE_RUNNER_HOME;
   if (asked !== undefined && !same(asked, HOME)) return 'it was loaded for another folder';
-  const prod = MERLE === PROD && (env.MERLE_URL === undefined || env.MERLE_URL === PROD);
+  const prod = PROD_URLS.includes(MERLE) && (env.MERLE_URL === undefined || env.MERLE_URL === MERLE);
   const real = same(HOME, REAL_HOME);
-  if (real && !prod) return `${HERE}’s own folder is for hellomerle.com only`;
+  if (real && !prod) return `${HERE}’s own folder is for ${PROD_HOSTS} only`;
   if (!real && (same(dirname(LOG), REAL_LOGS) || same(dirname(READING_LOG), REAL_LOGS)))
     return 'another folder needs a log of its own';
   // A named file inside this computer's own folder, as its links really lead, is its own pairing: hellomerle.com alone.
   const named = env.MERLE_RUNNER_TOKEN_FILE;
   if (keychain && named && !prod && inside(named, REAL_HOME))
-    return `the pairing in ${HERE}’s own folder is for hellomerle.com only`;
+    return `the pairing in ${HERE}’s own folder is for ${PROD_HOSTS} only`;
   if (keychain && !env.MERLE_KEYCHAIN_FILE && !named && (!real || !prod))
     return `the pairing in the Keychain, the Secret Service or its own file is for ${HERE}’s own folder only`;
   return null;
