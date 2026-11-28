@@ -38,7 +38,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -2287,14 +2287,78 @@ const WALK_MAX = 200_000;
  * in it now (made by a hook or a tool at checkout), folders Claude Code links in (any `worktree` setting but baseRef,
  * in the repo's settings or the user's), or files it copies in (.worktreeinclude). Anything it can't read counts as yes.
  */
+/**
+ * Whether a link in the commit points at something in the tree (never .git), read by its letters. The OS follows a
+ * target part by part, so letters prove nothing once a part is another link or a `..` comes after one: those are
+ * refused, as is a target that is itself a link (the review's Medium). One doc linked to another beside it passes.
+ */
+/**
+ * A link named as a config or agent file must land on something the run can't write either: a name on the run-time
+ * deny list (namedLater: the run-later configs and agents' files), never inside a dependency folder. One agent file
+ * linked to another passes. A plain target (`docs/guide.md`, `cfg`, `tools/hooks`), or a dot one only the push would
+ * hold (`.cache/hooks`, `.tmp/cfg`), would let the run's edits there be live under the protected name, past the
+ * sandbox's deny, which goes by real path (the final pass on #669, and the review of this check).
+ */
+const sameKind = (from, to) =>
+  !(DOT_HELD(from) || namedLater(from)) ||
+  (namedLater(to) &&
+    !String(to)
+      .split('/')
+      .some((x) => DEPS.includes(x.toLowerCase())));
+const inTree = (at, target, paths, links) => {
+  if (!target || target.length > 1024 || target.startsWith('/') || /[\0\\]/.test(target)) return false;
+  if (target.split('/').slice(1).includes('..')) return false;
+  const to = posix.normalize(posix.join(posix.dirname(at), target));
+  if (to.startsWith('../') || to === '..' || to === '.' || to.split('/')[0] === '.git' || !paths.has(to))
+    return false;
+  const parts = to.split('/');
+  return parts.every((_, i) => !links.has(parts.slice(0, i + 1).join('/'))) && sameKind(at, to);
+};
+/** A link on disk in the worktree that resolves, through any further links, to something inside it (never .git). */
+const linkStaysIn = (f, wt) => {
+  try {
+    const target = readlinkSync(f);
+    if (isAbsolute(target)) return false;
+    const root = realpathSync(wt);
+    const to = realpathSync(f);
+    const name = relative(root, join(realpathSync(dirname(f)), basename(f)))
+      .split(sep)
+      .join('/');
+    return (
+      to.startsWith(`${root}${sep}`) &&
+      !to.startsWith(`${join(root, '.git')}`) &&
+      sameKind(name, relative(root, to).split(sep).join('/'))
+    );
+  } catch {
+    return false;
+  }
+};
 const linksOut = (repo, made, userSettings) => {
   try {
-    const tree = spawnSync('git', [...NO_HOOKS, '-C', repo, 'ls-tree', '-r', made.commit], {
+    const tree = spawnSync('git', [...NO_HOOKS, '-C', repo, 'ls-tree', '-r', '-t', '-z', made.commit], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       maxBuffer: 256 * 1024 * 1024,
     });
-    if (tree.status !== 0 || /^120000 /m.test(tree.stdout)) return true;
+    if (tree.status !== 0) return true;
+    // A link in the commit is fine only when it stays inside the repo, to something there, never through .git (the
+    // lead's follow-up to #669: one doc linked to another). Absolute, leaving the tree or dangling: no rule.
+    const entries = String(tree.stdout)
+      .split('\0')
+      .filter(Boolean)
+      .map((l) => /^(\d{6}) (\w+) ([0-9a-f]{40,64})\t(.+)$/s.exec(l))
+      .filter(Boolean);
+    const paths = new Set(entries.map((m) => m[4]));
+    const links = entries.filter((m) => m[1] === '120000');
+    if (links.length > 200) return true;
+    const linkPaths = new Set(links.map((m) => m[4]));
+    for (const m of links) {
+      const t = spawnSync('git', [...NO_HOOKS, '-C', repo, 'cat-file', 'blob', m[3]], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      if (t.status !== 0 || !inTree(m[4], String(t.stdout), paths, linkPaths)) return true;
+    }
     let seen = 0;
     const stack = [made.wt];
     while (stack.length) {
@@ -2302,7 +2366,7 @@ const linksOut = (repo, made, userSettings) => {
       for (const e of readdirSync(d, { withFileTypes: true })) {
         if (++seen > WALK_MAX) return true;
         if (d === made.wt && e.name === '.git') continue;
-        if (e.isSymbolicLink()) return true;
+        if (e.isSymbolicLink() && !linkStaysIn(join(d, e.name), made.wt)) return true;
         if (e.isDirectory()) stack.push(join(d, e.name));
       }
     }
